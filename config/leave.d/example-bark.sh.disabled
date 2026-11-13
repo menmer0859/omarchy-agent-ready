@@ -1,0 +1,23 @@
+#!/bin/bash
+# Example hook — rename to `example-bark.sh` to enable.
+#
+# Called after Agent Ready restores everything (i.e. when you return). Good
+# place to send the watch digest to your phone / Home Assistant, or to archive
+# the state to the NAS.
+#
+# Available: AGENT_READY_ACTION, AGENT_READY_CONFIG_DIR, AGENT_READY_STATE_DIR,
+#            AGENT_READY_STATE_FILE.
+
+set -u
+
+DIGEST="$(omarchy-agent-ready digest get 2>/dev/null || echo '{}')"
+
+# Example: send a short summary to Bark (fill in your own endpoint).
+# SUMMARY="$(jq -r '[.agentsOnline // 0, .completed // 0, .failed // 0] | @tsv' <<<"$DIGEST")"
+# curl -sS --max-time 5 -G \
+#   --data-urlencode "title=Agent Ready · 值班结束" \
+#   --data-urlencode "body=$SUMMARY" \
+#   "https://your-nas/bark/YOUR_KEY" >/dev/null 2>&1 || true
+
+# Example: archive the digest to a NAS mount.
+# printf '%s\n' "$DIGEST" > /mnt/nas/agent-ready/digest-$(date +%F-%H%M).json

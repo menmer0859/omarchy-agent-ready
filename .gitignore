@@ -1,0 +1,20 @@
+# Runtime state and logs are never part of the repository.
+*.log
+*.bak
+*.tmp
+state/
+state.json
+pending.json
+digest.json
+history.json
+auto.json
+notify.id
+inhibit.pid
+frozen.pids
+lock
+log
+.local/state/
+.DS_Store
+
+# Local install smoke-test scratch
+/tmp/

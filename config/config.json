@@ -1,0 +1,45 @@
+{
+  "label": "Agent Ready",
+  "icons": { "active": "󰊚", "inactive": "󰊚" },
+  "notify": true,
+  "arm": {
+    "enabled": true,
+    "delaySec": 3,
+    "notify": false,
+    "allowEnterNow": true,
+    "notifyCancel": true,
+    "bark": { "enabled": false, "url": "", "title": "Agent Ready" }
+  },
+  "auto": {
+    "enabled": true,
+    "armAfterSec": null,
+    "cooldownSec": 60,
+    "disarmOnInput": true,
+    "requireInhibitorsClear": true,
+    "barkNotify": false
+  },
+  "preview": { "countdownSec": 3, "durationSec": 20 },
+  "enter": { "retrySec": 60 },
+  "language": "auto",
+  "digest": { "enabled": true },
+  "labels": {},
+  "inhibit": {
+    "enabled": true,
+    "what": "sleep:idle",
+    "mode": "block",
+    "why": "Agent Ready: keeping agents online"
+  },
+  "idle": { "linkStayAwake": true },
+  "powerProfile": { "enabled": true, "profile": "balanced" },
+  "screen": {
+    "lock": true,
+    "dpmsOff": true,
+    "keyboardBacklightOff": true,
+    "dimPercent": 0
+  },
+  "audio": { "mute": false, "suspendSinks": false },
+  "freeze": { "enabled": false, "patterns": [] },
+  "agents": {
+    "allow": []
+  }
+}

@@ -1,0 +1,1396 @@
+#!/bin/bash
+# Agent Ready — an Omarchy "agents on duty" power scene.
+#
+# Keeps background agents (pi / PyAgent / Hermes / OpenCode / Cindy / Codex /
+# ChatGPT / magpie / ...) online by blocking suspend and suppressing the idle
+# screensaver/lock, while dimming everything that is not needed: display output,
+# keyboard backlight, audio, the power profile, and optionally freezing
+# non-essential processes.
+#
+# Everything is driven by ~/.config/omarchy/agent-ready/config.json plus the
+# enter.d/ and leave.d/ hook directories. State (including a snapshot taken
+# before entering, so leaving restores exactly what was changed) lives in
+# ~/.local/state/omarchy/agent-ready/.
+#
+# See ~/.config/omarchy/agent-ready/README.md
+
+set -uo pipefail
+export LC_ALL=C
+
+CONFIG_DIR="${AGENT_READY_CONFIG_DIR:-$HOME/.config/omarchy/agent-ready}"
+STATE_DIR="${AGENT_READY_STATE_DIR:-$HOME/.local/state/omarchy/agent-ready}"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+STATE_FILE="$STATE_DIR/state.json"
+INHIBIT_PID_FILE="$STATE_DIR/inhibit.pid"
+PENDING_FILE="$STATE_DIR/pending.json"
+NOTIFY_ID_FILE="$STATE_DIR/notify.id"
+DIGEST_FILE="$STATE_DIR/digest.json"
+HISTORY_FILE="$STATE_DIR/history.json"
+FROZEN_FILE="$STATE_DIR/frozen.pids"
+LOCK_FILE="$STATE_DIR/lock"
+LOG_FILE="$STATE_DIR/log"
+SHELL_JSON="$HOME/.config/omarchy/shell.json"
+STAY_AWAKE_FILE="$HOME/.local/state/omarchy/indicators/stay-awake"
+
+# Notification/toolbar strings live in the bar widget's own i18n catalogs so
+# the QML UI and the CLI notifications share ONE source of truth. The display
+# language is ~/.config/omarchy/language (omarchy-language owns it); an
+# OMARCHY_LANGUAGE_FILE override pins it for tests, exactly like Commons.I18n
+# and omarchy-i18n. Missing/unexpected language = English.
+I18N_DIR="${AGENT_READY_I18N_DIR:-$HOME/.config/omarchy/plugins/eclipse.agent-ready/i18n}"
+LANGUAGE_FILE="${OMARCHY_LANGUAGE_FILE:-$HOME/.config/omarchy/language}"
+declare -A _I18N=()
+_I18N_LOADED=0
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+log()  { printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+die()  { printf 'agent-ready: %s\n' "$*" >&2; log "ERROR $*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-agent-ready <command>
+
+  status            Print Waybar-style JSON (default)
+  status-json       Full machine-readable state for the settings panel
+  config-json       Print the whole config as JSON
+  on                Enter immediately (no countdown)
+  off               Leave Agent Ready and restore the previous state
+  toggle            Arm / cancel the countdown / leave
+  arm [seconds]     Notify + countdown, then enter
+  auto-arm          Internal: arm triggered by the idle monitor
+  preview           Rehearse: short countdown, enter, auto-restore
+  reblank           Internal: re-blank outputs after a monitor change
+  disarm            Cancel a pending countdown
+  enter-now         Skip the remaining countdown and enter now
+  digest get        Show the current watch digest
+  digest set <json> Write external digest fields (hooks / integrations)
+  digest history    Show every completed watch as JSON
+  digest clear      Erase the current digest and the whole watch history
+  set <path> <val>  Update one config value
+  reset-config      Restore default config.json
+  doctor            Check config, dependencies and planned actions (no changes)
+  lang              Print the effective language (resolved from config + system)
+  edit              Open config.json in $EDITOR
+
+State and logs: ~/.local/state/omarchy/agent-ready/
+Config & hooks: ~/.config/omarchy/agent-ready/
+EOF
+}
+
+# ---------------------------------------------------------- localization ----
+
+# Resolve the effective display language. Priority:
+#   1. `config.language` (the plugin's own picker in the bar panel) when it is
+#      a concrete code such as "en" / "zh-CN". This changes ONLY this plugin's
+#      panel and notifications; the system language is left untouched.
+#   2. "auto" / "system" / null / empty / anything unexpected -> follow the
+#      system: ~/.config/omarchy/language (Setup > Language), read via
+#      LANGUAGE_FILE. OMARCHY_LANGUAGE_FILE pins it for tests and takes
+#      precedence over the plugin setting.
+# Then validate as a registry code and fall back regional -> base -> en
+# against the catalogs that actually exist, exactly like Commons.Translations.
+lang_code() {
+  local cand="" f choice
+  if [[ -z ${OMARCHY_LANGUAGE_FILE:-} ]]; then
+    choice=$(cfg '.language' 'auto')
+    case "$choice" in
+      auto|system|null|'') : ;;
+      *) [[ $choice =~ ^[a-z]{2,3}(-[A-Za-z]{2})?$ ]] && cand="$choice" ;;
+    esac
+  fi
+  if [[ -z $cand ]]; then
+    f="$LANGUAGE_FILE"
+    [[ -r $f ]] && IFS= read -r cand <"$f" || true
+  fi
+  cand=${cand//[[:space:]]/}
+  [[ $cand =~ ^[a-z]{2,3}(-[A-Za-z]{2})?$ ]] || cand=en
+  [[ -r $I18N_DIR/$cand.json ]] || cand=${cand%%-*}
+  [[ -r $I18N_DIR/$cand.json ]] || cand=en
+  printf '%s' "$cand"
+}
+
+# Merge en.json (base) then <language>.json (overlay) into an associative
+# array, once per process. NUL-delimited so values may contain spaces,
+# punctuation, %1 holes, etc. Missing keys fall back to English per string,
+# mirroring Commons.Translations.
+i18n_load() {
+  (( _I18N_LOADED )) && return 0
+  _I18N_LOADED=1
+  local code cat k v
+  code=$(lang_code)
+  for cat in "$I18N_DIR/en.json" "$I18N_DIR/$code.json"; do
+    [[ -r $cat ]] || continue
+    while IFS= read -r -d '' k && IFS= read -r -d '' v; do
+      _I18N["$k"]=$v
+    done < <(jq -j 'to_entries[] | select(.value | type == "string") | (.key, .value) | . + "\u0000"' "$cat" 2>/dev/null)
+  done
+}
+
+# Localized string with %1..%N substituted from the trailing args. Falls back
+# language -> en.json -> key. Sentinels keep an argument that itself contains
+# a %N sequence from being substituted twice (same trick as omarchy-i18n).
+# Named `t()` (like Omarchy's I18n.t) ON PURPOSE: `tr()` would shadow the
+# coreutils `tr` used elsewhere in this script for /proc cmdlines and tokens.
+t() {
+  local key="$1"; shift
+  i18n_load
+  local string i a
+  if [[ -v _I18N[$key] ]]; then string=${_I18N[$key]}; else string=$key; fi
+  if (( $# > 0 )); then
+    for (( i = 1; i <= $#; i++ )); do
+      string=${string//%$i/$'\001'"$i"$'\002'}
+    done
+    i=1
+    for a in "$@"; do
+      string=${string//$'\001'"$i"$'\002'/"$a"}
+      i=$((i + 1))
+    done
+  fi
+  printf '%s' "$string"
+}
+
+# ---------------------------------------------------------------- config ----
+
+# Read a scalar from config.json. Booleans come back as true/false, strings
+# unquoted. Missing keys / missing file fall back to the supplied default.
+cfg() {
+  local raw
+  raw=$(jq -c "$1" "$CONFIG_FILE" 2>/dev/null) || raw="null"
+  if [[ -z $raw || $raw == null ]]; then printf '%s' "$2"; return 0; fi
+  raw=${raw#\"}
+  raw=${raw%\"}
+  printf '%s' "$raw"
+}
+
+cfg_array() {
+  [[ -r $CONFIG_FILE ]] || return 0
+  jq -r "$1[]? // empty" "$CONFIG_FILE" 2>/dev/null || true
+}
+
+config_json() {
+  if [[ -r $CONFIG_FILE ]]; then jq -c . "$CONFIG_FILE" 2>/dev/null || echo '{}'
+  else echo '{}'
+  fi
+}
+
+# Safe, typed write into config.json. Paths and values are quoted by the caller
+# (the QML panel uses Util.shellQuote), and jq treats the value as data, never
+# as an expression.
+set_config() {
+  local path="$1" value="$2" tmp json_value
+  [[ $path =~ ^\.?[A-Za-z0-9_.-]+$ ]] || die "invalid config path: $path"
+  tmp="$CONFIG_FILE.tmp"
+
+  case "$value" in
+    true|false) json_value="$value" ;;
+    *)
+      if [[ $value =~ ^-?[0-9]+$ ]]; then json_value="$value"
+      else json_value=$(jq -Rn --arg v "$value" '$v')
+      fi ;;
+  esac
+
+  if jq --arg p "$path" --argjson v "$json_value" '
+       ($p | ltrimstr(".") | split(".") | map(select(length > 0))) as $keys
+       | setpath($keys; $v)' "$CONFIG_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$CONFIG_FILE" || die "cannot write $CONFIG_FILE"
+    log "config $path = $value"
+  else
+    rm -f "$tmp"
+    die "failed to update $path"
+  fi
+}
+
+reset_config() {
+  cat >"$CONFIG_FILE" <<'EOF'
+{
+  "label": "Agent Ready",
+  "icons": { "active": "󰊚", "inactive": "󰊚" },
+  "notify": true,
+  "arm": {
+    "enabled": true,
+    "delaySec": 3,
+    "notify": false,
+    "allowEnterNow": true,
+    "notifyCancel": true,
+    "bark": { "enabled": false, "url": "", "title": "Agent Ready" }
+  },
+  "auto": {
+    "enabled": true,
+    "armAfterSec": null,
+    "cooldownSec": 60,
+    "disarmOnInput": true,
+    "requireInhibitorsClear": true,
+    "barkNotify": false
+  },
+  "preview": { "countdownSec": 3, "durationSec": 20 },
+  "enter": { "retrySec": 60 },
+  "language": "auto",
+  "digest": { "enabled": true },
+  "labels": {},
+  "inhibit": {
+    "enabled": true,
+    "what": "sleep:idle",
+    "mode": "block",
+    "why": "Agent Ready: keeping agents online"
+  },
+  "idle": { "linkStayAwake": true },
+  "powerProfile": { "enabled": true, "profile": "balanced" },
+  "screen": {
+    "lock": true,
+    "dpmsOff": true,
+    "keyboardBacklightOff": true,
+    "dimPercent": 0
+  },
+  "audio": { "mute": false, "suspendSinks": false },
+  "freeze": { "enabled": false, "patterns": [] },
+  "agents": {
+    "allow": []
+  }
+}
+EOF
+  jq -e . "$CONFIG_FILE" >/dev/null || die "reset produced invalid config"
+  log "config reset to defaults"
+}
+
+# -------------------------------------------------------------- pending ----
+
+is_pending() {
+  [[ -r $PENDING_FILE ]] || return 1
+  jq -e '.token? and .until?' "$PENDING_FILE" >/dev/null 2>&1
+}
+
+pending_token() { jq -r '.token // ""' "$PENDING_FILE" 2>/dev/null || echo ""; }
+pending_until()  { jq -r '.until // 0' "$PENDING_FILE" 2>/dev/null || echo 0; }
+pending_delay()  { jq -r '.delay // 0' "$PENDING_FILE" 2>/dev/null || echo 0; }
+
+pending_clear() {
+  rm -f "$PENDING_FILE" "$NOTIFY_ID_FILE"
+}
+
+# Human-readable summary of what entering will actually do, used by the
+# countdown notification and Bark push so the delay is never a surprise. The
+# phrases are the widget's own `summary.*` catalog keys, so the QML card and
+# every notification always agree and follow the same display language.
+arm_summary() {
+  local parts=() joined="" p sep
+  sep=$(t notify.sep)
+  [[ $(cfg '.inhibit.enabled' true) == true ]] && parts+=("$(t summary.inhibit)")
+  [[ $(cfg '.idle.linkStayAwake' true) == true ]] && parts+=("$(t summary.idle)")
+  [[ $(cfg '.screen.lock' true) == true ]] && parts+=("$(t summary.lock)")
+  [[ $(cfg '.screen.dpmsOff' true) == true ]] && parts+=("$(t summary.dpms)")
+  [[ $(cfg '.audio.mute' false) == true ]] && parts+=("$(t summary.mute)")
+  [[ $(cfg '.powerProfile.enabled' true) == true ]] && parts+=("$(t summary.power)")
+  parts+=("$(t summary.agents)")
+  for p in "${parts[@]}"; do
+    [[ -n $joined ]] && joined+="$sep"
+    joined+="$p"
+  done
+  printf '%s' "$joined"
+}
+
+arm_notification() {
+  [[ $(cfg '.arm.notify' false) == true ]] || return 0
+  local delay="$1" summary title body icon id app
+  icon=$(cfg '.icons.active' '󰊚')
+  app=$(cfg '.label' 'Agent Ready')
+  summary=$(arm_summary)
+  # Catalog defaults are localized (and already %1-substituted). A .labels.*
+  # value in config.json wins if the user set one; legacy %S / %A tokens in
+  # such an override are still honoured below.
+  title=$(cfg '.labels.armingTitle' "$(t notify.armingTitle "$delay")")
+  body=$(cfg '.labels.armingBody' "$(t notify.armingBody "$summary")")
+  title=${title//%S/$delay}
+  body=${body//%S/$delay}
+  body=${body//%A/$summary}
+
+  local -a args=(omarchy-notification-send -g "$icon" -u normal -t $((delay * 1000))
+                 --app-name "$app" -p "$title" "$body")
+  [[ $(cfg '.arm.allowEnterNow' true) == true ]] && \
+    args+=(--action "$(cfg '.labels.enterNow' "$(t notify.enterNow)")" omarchy-agent-ready enter-now)
+  args+=(--action "$(cfg '.labels.cancel' "$(t notify.cancel)")" omarchy-agent-ready disarm)
+
+  id=$("${args[@]}" 2>/dev/null) || true
+  [[ ${id:-} =~ ^[0-9]+$ ]] && printf '%s\n' "$id" >"$NOTIFY_ID_FILE"
+}
+
+# Optional remote push. `arm.bark.url` is the full GET endpoint of your Bark
+# service; title/body are sent as URL-encoded query parameters. Intentionally
+# dumb — if your deployment wants a different shape, use an enter.d hook.
+bark_send() {
+  local title="$1" body="$2" url
+  url=$(cfg '.arm.bark.url' '')
+  [[ -n $url ]] || return 0
+  command -v curl >/dev/null 2>&1 || { log "bark: curl unavailable"; return 0; }
+  curl -sS --max-time 5 -G \
+    --data-urlencode "title=$title" \
+    --data-urlencode "body=$body" \
+    "$url" >/dev/null 2>&1 || log "bark: push failed"
+}
+
+arm_bark() {
+  [[ $(cfg '.arm.bark.enabled' false) == true ]] || return 0
+  local delay="$1"
+  bark_send "$(cfg '.arm.bark.title' 'Agent Ready')" \
+            "$(t notify.barkArm "$delay" "$(arm_summary)")"
+}
+
+dismiss_notification() {
+  [[ -r $NOTIFY_ID_FILE ]] || return 0
+  local id=""
+  IFS= read -r id <"$NOTIFY_ID_FILE" || true
+  if [[ ${id:-} =~ ^[0-9]+$ ]]; then
+    omarchy-notification-send -r "$id" -t 1 -g "$(cfg '.icons.active' '󰊚')" \
+      "$(cfg '.label' 'Agent Ready')" \
+      "$(cfg '.labels.cancelled' "$(t notify.cancelled)")" >/dev/null 2>&1 || true
+  fi
+  rm -f "$NOTIFY_ID_FILE"
+}
+
+# ----------------------------------------------------------------- state ----
+
+is_enabled() {
+  [[ -r $STATE_FILE ]] || return 1
+  [[ $(jq -r '.enabled // false' "$STATE_FILE" 2>/dev/null) == true ]]
+}
+
+write_state() {
+  local enabled="$1" since="$2" snapshot="$3" phase="$4" tmp="$STATE_FILE.tmp"
+  if jq -n --argjson enabled "$enabled" --arg since "$since" \
+      --argjson snapshot "$snapshot" --arg phase "$phase" \
+      '{enabled:$enabled, since:$since, snapshot:$snapshot, phase:$phase}' >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE"
+  else
+    rm -f "$tmp"
+    die "failed to write state file"
+  fi
+}
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
+  # Two bar-widget instances (one per monitor) can legitimately issue the same
+  # command at unlock. Give the second one a moment to wait instead of failing
+  # with a spurious ERROR; after the first finishes it sees the new state and
+  # returns without doing anything.
+  flock -w 3 9 || die "another Agent Ready action is still running"
+}
+
+notify() {
+  [[ $(cfg '.notify' true) == true ]] || return 0
+  # Preview is a self-contained rehearsal: no desktop notifications.
+  [[ $(state_get previewActive false) == true ]] && return 0
+  local icon; icon=$(cfg '.icons.active' '󰊚')
+  omarchy-notification-send -g "$icon" "$1" "$2" >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------- phase / digest ----
+
+patch_state() {
+  local key="$1" value="$2" tmp="$STATE_FILE.tmp"
+  [[ -r $STATE_FILE ]] || return 0
+  if jq --arg k "$key" --argjson v "$value" '.[$k] = $v' "$STATE_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# Same as patch_state but for plain strings (phase names, etc.).
+patch_state_str() {
+  local key="$1" value="$2" tmp="$STATE_FILE.tmp"
+  [[ -r $STATE_FILE ]] || return 0
+  if jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$STATE_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+clear_state_field() {
+  local key="$1" tmp="$STATE_FILE.tmp"
+  [[ -r $STATE_FILE ]] || return 0
+  if jq --arg k "$key" 'del(.[$k])' "$STATE_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+state_get() {
+  [[ -r $STATE_FILE ]] || { printf '%s' "$2"; return 0; }
+  local v; v=$(jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null) || v=""
+  [[ -n $v && $v != null ]] && printf '%s' "$v" || printf '%s' "$2"
+}
+
+phase() { state_get phase off; }
+
+uptime_minutes() {
+  local since="${1:-}" started now mins
+  [[ -n $since ]] || since=$(state_get since "")
+  [[ -n $since ]] || { echo 0; return 0; }
+  started=$(date -d "$since" +%s 2>/dev/null || echo 0)
+  now=$(date +%s)
+  mins=$(( (now - started) / 60 ))
+  (( mins < 0 )) && mins=0
+  echo "$mins"
+}
+
+# Names of agent runtimes currently seen by exact process-name match. Kept as
+# a set of allow-list names (not PIDs): counting processes would double-count
+# Electron helpers and match path fragments like `codex-home`. Agents launched
+# through node/python are not detected here — hooks can supply a precise
+# `agents` array via `digest set`, which takes priority in the history record.
+agent_names() {
+  load_agent_allow
+  local kw names=()
+  for kw in "${AGENT_ALLOW[@]}"; do
+    pgrep -x -i -- "$kw" >/dev/null 2>&1 && names+=("$kw")
+  done
+  jq -nc '$ARGS.positional' --args -- "${names[@]}"
+}
+
+agent_count() { agent_names | jq 'length'; }
+
+# Catalog keys for the actions that were in effect during a watch. The QML
+# panel renders each as strings.t("summary." + key), so history records stay
+# language-neutral no matter which language was active when they were written.
+active_action_keys() {
+  local keys=()
+  [[ $(cfg '.inhibit.enabled' true) == true ]] && keys+=(inhibit)
+  [[ $(cfg '.idle.linkStayAwake' true) == true ]] && keys+=(idle)
+  [[ $(cfg '.screen.lock' true) == true ]] && keys+=(lock)
+  [[ $(cfg '.screen.dpmsOff' true) == true ]] && keys+=(dpms)
+  [[ $(cfg '.audio.mute' false) == true ]] && keys+=(mute)
+  [[ $(cfg '.powerProfile.enabled' true) == true ]] && keys+=(power)
+  keys+=(agents)
+  jq -nc '$ARGS.positional' --args -- "${keys[@]}"
+}
+
+# Digest is a fixed contract for the CURRENT/last watch. Built-in fields are
+# refreshed on enter/leave (never on the status hot path); external fields
+# (completed/failed/pending/note/agents) come from hooks or `digest set`.
+# `since` may be passed explicitly by do_off, because it clears state.since
+# before the final refresh — otherwise uptime would always read 0.
+refresh_digest() {
+  [[ $(cfg '.digest.enabled' true) == true ]] || return 0
+  local since="${1:-}" prev='{}' count mins last tmp
+  [[ -r $DIGEST_FILE ]] && prev=$(jq -c . "$DIGEST_FILE" 2>/dev/null || echo '{}')
+  count=$(agent_count)
+  mins=$(uptime_minutes "$since")
+  last=$(tail -1 "$LOG_FILE" 2>/dev/null | cut -c1-160)
+  tmp="$DIGEST_FILE.tmp"
+  if jq -n --argjson prev "$prev" --argjson agentsOnline "$count" \
+      --argjson uptimeMin "$mins" --arg lastEvent "$last" \
+      '{agentsOnline:$agentsOnline, uptimeMin:$uptimeMin, lastEvent:$lastEvent}
+       + ($prev | {completed,failed,pending,note,agents} | with_entries(select(.value != null)))' \
+      >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$DIGEST_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+digest_json() {
+  if [[ -r $DIGEST_FILE ]]; then jq -c . "$DIGEST_FILE" 2>/dev/null || echo '{}'
+  else echo '{}'; fi
+}
+
+# ---------------------------------------------------------- watch history ----
+
+# history.json is a rolling array of every completed watch (newest last). Each
+# record is fully structured and language-neutral: timestamps, a duration in
+# seconds, a trigger code, agent NAMES, action keys and the external digest
+# fields. The QML panel formats and translates all of it. Capped at 200 so the
+# file (and every status-json poll) stays small over months of use.
+history_json() {
+  if [[ -r $HISTORY_FILE ]]; then
+    jq -c 'if type == "array" then . else [] end' "$HISTORY_FILE" 2>/dev/null || echo '[]'
+  else echo '[]'; fi
+}
+
+history_seq() {
+  [[ -r $HISTORY_FILE ]] || { echo 1; return 0; }
+  local n
+  n=$(jq -r 'if type == "array" and length > 0 then ((.[-1].seq // 0) + 1) else 1 end' \
+      "$HISTORY_FILE" 2>/dev/null) || n=1
+  [[ $n =~ ^[0-9]+$ ]] || n=1
+  printf '%s\n' "$n"
+}
+
+# Append one completed watch. Called from do_off BEFORE it clears state, with
+# the ISO start time passed in. No-op when the digest feature is disabled.
+record_digest_history() {
+  [[ $(cfg '.digest.enabled' true) == true ]] || return 0
+  local since="$1" trigger="${2:-manual}"
+  local until_now duration started now agents actions seq prev d tmp hook_agents
+  [[ -n $since ]] || return 0
+  until_now=$(date -Is)
+  started=$(date -d "$since" +%s 2>/dev/null || echo 0)
+  now=$(date +%s)
+  duration=$(( now - started )); (( duration < 0 )) && duration=0
+  actions=$(active_action_keys)
+  d=$(digest_json)
+  agents=$(agent_names)
+  hook_agents=$(jq -c 'if (.agents | type) == "array" then .agents else empty end' <<<"$d" 2>/dev/null)
+  [[ -n $hook_agents ]] && agents="$hook_agents"
+  seq=$(history_seq)
+  prev=$(history_json)
+  tmp="$HISTORY_FILE.tmp"
+  if jq -n --argjson prev "$prev" --argjson seq "$seq" \
+      --arg since "$since" --arg until "$until_now" \
+      --argjson durationSec "$duration" --arg trigger "$trigger" \
+      --argjson agents "$agents" --argjson actions "$actions" \
+      --arg powerProfile "$(cfg '.powerProfile.profile' balanced)" \
+      --argjson digest "$d" \
+      '($digest) as $x
+       | {seq:$seq, since:$since, until:$until, durationSec:$durationSec,
+          trigger:$trigger, agents:$agents, agentsOnline:($agents | length),
+          actions:$actions, powerProfile:$powerProfile,
+          completed:($x.completed // null), failed:($x.failed // null),
+          pending:($x.pending // null), note:($x.note // null),
+          lastEvent:($x.lastEvent // null)}
+       | with_entries(select(.value != null)) as $rec
+       | ($prev + [$rec])[-200:]' >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$HISTORY_FILE"
+    log "watch #$seq recorded (${duration}s, trigger=$trigger, agents=$(jq -r 'length' <<<"$agents"))"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# Auto-arm threshold. `null` (default) follows the system: take the smaller of
+# idle.screensaver / idle.lock, then subtract the countdown and a safety buffer
+# so our countdown always finishes before the system screensaver starts.
+auto_threshold() {
+  local configured delay screensaver lock base threshold minimum
+  configured=$(cfg '.auto.armAfterSec' 'null')
+  delay=$(cfg '.arm.delaySec' 3)
+  [[ $delay =~ ^[0-9]+$ ]] || delay=3
+  if [[ $configured != null && $configured =~ ^[0-9]+$ ]] && (( configured > 0 )); then
+    jq -nc --argjson t "$configured" '{thresholdSec:$t, available:true, source:"config"}'
+    return 0
+  fi
+  screensaver=$(jq -r '.idle.screensaver // 150' "$SHELL_JSON" 2>/dev/null || echo 150)
+  lock=$(jq -r '.idle.lock // 300' "$SHELL_JSON" 2>/dev/null || echo 300)
+  [[ $screensaver =~ ^[0-9]+$ ]] || screensaver=150
+  [[ $lock =~ ^[0-9]+$ ]] || lock=300
+  minimum=$(( delay + 60 ))
+  base=$screensaver; (( lock < base )) && base=$lock
+  if (( base < minimum )); then
+    jq -nc --argjson base "$base" \
+      '{thresholdSec:30, available:false, source:"system", baseSec:$base, reason:"system idle time too short"}'
+    return 0
+  fi
+  threshold=$(( base - delay - 30 ))
+  (( threshold < 30 )) && threshold=30
+  jq -nc --argjson t "$threshold" --argjson base "$base" \
+    '{thresholdSec:$t, available:true, source:"system", baseSec:$base}'
+}
+
+# Stable identity of the connected outputs. A DPMS on/off flip is NOT a
+# change here — the lock plugin legitimately wakes the screen for face scan.
+monitor_ids() {
+  hyprctl monitors -j 2>/dev/null | jq -c '[.[] | select(.disabled == false) | .name] | sort' 2>/dev/null || echo '[]'
+}
+
+health_json() {
+  local enabled=false inhibitor=ok lock=ok dpms=ok dpms_lit=0 lr ll auto=ok
+  local ids_now='[]' ids_saved='[]' changed=false
+  is_enabled && enabled=true
+  if [[ $enabled == true ]]; then
+    inhibit_alive || inhibitor=lost
+    lr=$(LC_ALL=C.UTF-8 timeout 1 omarchy-shell lock status 2>/dev/null | grep -m1 '^{') || lr=""
+    if [[ -n $lr ]]; then
+      ll=$(jq -r 'if has("locked") then .locked else false end' <<<"$lr" 2>/dev/null) || ll=false
+      [[ $ll == true ]] && lock=ok || lock=unknown
+    else
+      lock=unknown
+    fi
+    [[ $(state_get healthLockFailed false) == true ]] && lock=failed
+
+    # Only a change in the *set of monitors* means a new output may be lit.
+    # `dpmsLit` is informational only: it is true during every legitimate
+    # wake (user keypress, face scan, unlock), so it must never drive a
+    # re-blank or a degraded badge.
+    ids_now=$(monitor_ids)
+    ids_saved=$(jq -c '.monitorIds // []' "$STATE_FILE" 2>/dev/null || echo '[]')
+    dpms_lit=$(hyprctl monitors -j 2>/dev/null | jq '[.[] | select(.disabled==false and .dpmsStatus==true)] | length' 2>/dev/null) || dpms_lit=0
+    [[ $dpms_lit =~ ^[0-9]+$ ]] || dpms_lit=0
+    if [[ $ids_saved != '[]' && $ids_now != "$ids_saved" ]]; then
+      dpms=degraded
+      changed=true
+    fi
+  fi
+  [[ $(jq -r '.available' <<<"$(auto_threshold)" 2>/dev/null) == false ]] && auto=degraded
+  jq -nc --arg inhibitor "$inhibitor" --arg lock "$lock" --arg dpms "$dpms" \
+      --arg audio ok --arg auto "$auto" --argjson dpmsLit "$dpms_lit" \
+      --argjson monitorsChanged "$changed" \
+      '{inhibitor:$inhibitor, lock:$lock, dpms:$dpms, audio:$audio, auto:$auto,
+        dpmsLit:$dpmsLit, monitorsChanged:$monitorsChanged}'
+}
+
+# -------------------------------------------------------------- inhibitor ----
+
+# systemd-inhibit execs its child, so the PID we record is the very process
+# holding the inhibitor fd. Give it a distinctive argv[0] so we can tell a live
+# inhibitor from a reused PID.
+inhibit_alive() {
+  [[ -r $INHIBIT_PID_FILE ]] || return 1
+  local pid cmd
+  IFS= read -r pid <"$INHIBIT_PID_FILE" || return 1
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 1
+  [[ $cmd == *omarchy-agent-ready-inhibit* ]]
+}
+
+start_inhibit() {
+  [[ $(cfg '.inhibit.enabled' true) == true ]] || { log "inhibit disabled by config"; return 0; }
+  if inhibit_alive; then log "inhibit already alive"; return 0; fi
+
+  local what mode why pid
+  what=$(cfg '.inhibit.what' 'sleep:idle')
+  mode=$(cfg '.inhibit.mode' 'block')
+  why=$(cfg '.inhibit.why' 'Agent Ready: keeping agents online')
+
+  # fd 9 is our action lock; don't leak it into the long-lived inhibitor.
+  nohup systemd-inhibit \
+      --what="$what" --mode="$mode" \
+      --who=omarchy-agent-ready --why="$why" \
+      bash -c 'exec -a omarchy-agent-ready-inhibit sleep infinity' \
+      9>&- >/dev/null 2>&1 </dev/null &
+  pid=$!
+  printf '%s\n' "$pid" >"$INHIBIT_PID_FILE"
+  sleep 0.2
+  if inhibit_alive; then
+    log "inhibit started pid=$pid what=$what mode=$mode"
+  else
+    log "WARNING inhibit pid=$pid did not stay alive; suspend is NOT blocked"
+  fi
+}
+
+stop_inhibit() {
+  [[ -r $INHIBIT_PID_FILE ]] || return 0
+  local pid=""
+  IFS= read -r pid <"$INHIBIT_PID_FILE" || true
+  [[ ${pid:-} =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null || true
+  rm -f "$INHIBIT_PID_FILE"
+  log "inhibit stopped"
+}
+
+# ------------------------------------------------------- agent allow list ----
+
+AGENT_ALLOW=()
+load_agent_allow() {
+  local item
+  AGENT_ALLOW=()
+  while IFS= read -r item; do
+    [[ -n $item ]] && AGENT_ALLOW+=("${item,,}")
+  done < <(cfg_array '.agents.allow')
+  # An empty list is intentional: no machine-specific implicit defaults.
+  # Configure agents.allow for this machine before enabling process freezing.
+}
+
+# Used to make sure a "non-essential process" freeze never touches an agent.
+is_agent_cmd() {
+  local cmd="${1,,}" kw
+  for kw in "${AGENT_ALLOW[@]}"; do
+    [[ $cmd =~ (^|[^a-z0-9])${kw}([^a-z0-9]|$) ]] && return 0
+  done
+  return 1
+}
+
+freeze_processes() {
+  [[ $(cfg '.freeze.enabled' false) == true ]] || return 0
+  load_agent_allow
+  : >"$FROZEN_FILE"
+  local pattern pid cmd
+  while IFS= read -r pattern; do
+    [[ -n $pattern ]] || continue
+    while IFS= read -r pid; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      (( pid == $$ )) && continue
+      cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+      [[ -n $cmd ]] || continue
+      is_agent_cmd "$cmd" && continue          # never freeze an agent
+      grep -qxF "$pid" "$FROZEN_FILE" && continue
+      kill -STOP "$pid" 2>/dev/null && printf '%s\n' "$pid" >>"$FROZEN_FILE"
+    done < <(pgrep -f -- "$pattern" 2>/dev/null || true)
+  done < <(cfg_array '.freeze.patterns')
+  log "froze $(wc -l <"$FROZEN_FILE") processes"
+}
+
+unfreeze_processes() {
+  [[ -r $FROZEN_FILE ]] || return 0
+  local pid
+  while IFS= read -r pid; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    kill -CONT "$pid" 2>/dev/null || true
+  done <"$FROZEN_FILE"
+  rm -f "$FROZEN_FILE"
+}
+
+# ------------------------------------------------------------------ hooks ----
+
+# Anything executable-ish named *.sh in these directories runs after the
+# built-in actions, in filename order. Env vars let hooks find the state.
+run_hooks() {
+  local dir="$1" action="$2" f
+  [[ -d $dir ]] || return 0
+  while IFS= read -r -d '' f; do
+    [[ -f $f ]] || continue
+    log "hook $action $(basename "$f")"
+    AGENT_READY_ACTION="$action" \
+    AGENT_READY_CONFIG_DIR="$CONFIG_DIR" \
+    AGENT_READY_STATE_DIR="$STATE_DIR" \
+    AGENT_READY_STATE_FILE="$STATE_FILE" \
+      bash "$f" >>"$LOG_FILE" 2>&1 || log "hook failed: $f"
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.sh' -print0 2>/dev/null | sort -z)
+}
+
+# ------------------------------------------------------------------ status ----
+
+do_status() {
+  local enabled=false since="" icon class tip uptime started now mins
+  if is_pending; then
+    local until_now delay remaining
+    until_now=$(pending_until)
+    delay=$(pending_delay)
+    remaining=$(( until_now - $(date +%s) ))
+    (( remaining < 0 )) && remaining=0
+    jq -nc --arg text "$(cfg '.icons.active' '󰊚')" \
+        --arg tooltip "$(t status.arming "$remaining")" \
+        --arg class "active" '{text:$text, tooltip:$tooltip, class:$class}'
+    return 0
+  fi
+  if [[ -r $STATE_FILE ]]; then
+    enabled=$(jq -r '.enabled // false' "$STATE_FILE" 2>/dev/null || echo false)
+    since=$(jq -r '.since // ""' "$STATE_FILE" 2>/dev/null || echo "")
+  fi
+
+  if [[ $enabled == true ]]; then
+    class=active
+    icon=$(cfg '.icons.active' '󰊚')
+    started=$(date -d "$since" +%s 2>/dev/null || echo 0)
+    now=$(date +%s)
+    mins=$(( (now - started) / 60 ))
+    (( mins < 0 )) && mins=0
+    uptime="${mins}m"
+
+    # Describe what is actually in effect, so a customized config is not
+    # misrepresented by a hard-coded tooltip.
+    local parts=() p joined=""
+    [[ $(cfg '.inhibit.enabled' true) == true ]] && parts+=("$(t status.partSuspend)")
+    [[ $(cfg '.idle.linkStayAwake' true) == true ]] && parts+=("$(t status.partIdle)")
+    [[ $(cfg '.screen.dpmsOff' true) == true ]] && parts+=("$(t status.partDpms)")
+    [[ $(cfg '.audio.mute' false) == true ]] && parts+=("$(t status.partMute)")
+    [[ $(cfg '.powerProfile.enabled' true) == true ]] && parts+=("$(cfg '.powerProfile.profile' balanced)")
+    for p in "${parts[@]}"; do
+      [[ -n $joined ]] && joined+=" · "
+      joined+="$p"
+    done
+    [[ -n $joined ]] && joined=" · ${joined}"
+    tip=$(t status.on "$uptime" "$joined")
+    if [[ $(cfg '.inhibit.enabled' true) == true ]] && ! inhibit_alive; then
+      tip="$(t status.inhibitorLost)${tip}"
+    fi
+    tip="${tip}$(t status.clickRestore)"
+  else
+    class=inactive
+    icon=$(cfg '.icons.inactive' '󰊚')
+    tip=$(t status.off)
+  fi
+
+  jq -nc --arg text "$icon" --arg tooltip "$tip" --arg class "$class" \
+      '{text:$text, tooltip:$tooltip, class:$class}'
+}
+
+# ---------------------------------------------------------------- machine API ----
+
+# Full state for the QML panel. The panel polls this instead of parsing files,
+# so config edits and the countdown stay in one place.
+do_status_json() {
+  local enabled=false since="" uptime=0 pending=false remaining=0 delay=0 inhibit=false
+  if [[ -r $STATE_FILE ]]; then
+    enabled=$(jq -r '.enabled // false' "$STATE_FILE" 2>/dev/null || echo false)
+    since=$(jq -r '.since // ""' "$STATE_FILE" 2>/dev/null || echo "")
+    if [[ $enabled == true && -n $since ]]; then
+      local started now0
+      started=$(date -d "$since" +%s 2>/dev/null || echo 0)
+      now0=$(date +%s)
+      uptime=$(( (now0 - started) / 60 ))
+      (( uptime < 0 )) && uptime=0
+    fi
+  fi
+  local token=""
+  if is_pending; then
+    pending=true
+    delay=$(pending_delay)
+    token=$(pending_token)
+    remaining=$(( $(pending_until) - $(date +%s) ))
+    (( remaining < 0 )) && remaining=0
+  fi
+  inhibit_alive && inhibit=true
+
+  # Lock state is only meaningful while we are active. The bar widget watches
+  # the true -> false transition and calls `off`, so returning to the desktop
+  # always restores everything (including the Stay Awake marker).
+  # null = unknown (IPC failed); never treat an unknown as "unlocked".
+  local locked=null lock_reply="" parsed=""
+  if [[ $enabled == true ]]; then
+    # omarchy-shell is Qt: with LC_ALL=C it prints a locale warning on stdout
+    # ahead of the JSON. Force a UTF-8 locale and take only the JSON line.
+    lock_reply=$(LC_ALL=C.UTF-8 timeout 1 omarchy-shell lock status 2>/dev/null \
+                 | grep -m1 '^{') || lock_reply=""
+    if [[ -n $lock_reply ]]; then
+      parsed=$(jq -r 'if has("locked") then .locked else (.sessionLocked // false) end' \
+               <<<"$lock_reply" 2>/dev/null) || parsed=""
+      [[ $parsed == true ]] && locked=true
+      [[ $parsed == false ]] && locked=false
+    fi
+  fi
+
+  local phase_val; phase_val=$(phase)
+  local auto_triggered=false
+  if is_pending && [[ $(jq -r '.autoTriggered // false' "$PENDING_FILE" 2>/dev/null) == true ]]; then
+    auto_triggered=true
+  fi
+
+  local preview_active=false preview_until=0
+  [[ $(state_get previewActive false) == true ]] && preview_active=true
+  preview_until=$(state_get previewUntil 0)
+  [[ $preview_until =~ ^[0-9]+$ ]] || preview_until=0
+
+  local retry_json=null
+  if [[ $(state_get healthLockFailed false) == true ]]; then
+    retry_json=$(jq -nc --argjson at "$(state_get retryAt 0)" \
+                        --argjson count "$(state_get retryCount 0)" \
+                        '{at:$at, count:$count, failed:true}')
+  fi
+
+  local last_off cooldown remaining_cd=0 now_s
+  last_off=$(state_get lastOffAt 0)
+  cooldown=$(cfg '.auto.cooldownSec' 60)
+  [[ $cooldown =~ ^[0-9]+$ ]] || cooldown=60
+  now_s=$(date +%s)
+  if [[ $last_off =~ ^[0-9]+$ ]] && (( last_off > 0 )); then
+    remaining_cd=$(( last_off + cooldown - now_s ))
+    (( remaining_cd < 0 )) && remaining_cd=0
+  fi
+
+  local auto_json
+  auto_json=$(auto_threshold)
+  auto_json=$(jq -c --argjson enabled "$(cfg '.auto.enabled' true)" \
+                    --argjson cooldown "$remaining_cd" \
+                    '. + {enabled:$enabled, cooldownRemainingSec:$cooldown}' <<<"$auto_json")
+
+  local enabled_json=false
+  [[ $enabled == true ]] && enabled_json=true
+  jq -nc \
+      --argjson enabled "$enabled_json" \
+      --argjson pending "$pending" \
+      --argjson remainingSec "$remaining" \
+      --argjson delaySec "$delay" \
+      --argjson uptimeMin "$uptime" \
+      --argjson inhibitAlive "$inhibit" \
+      --arg pendingToken "$token" \
+      --argjson locked "$locked" \
+      --arg phase "$phase_val" \
+      --argjson autoTriggered "$auto_triggered" \
+      --argjson previewActive "$preview_active" \
+      --argjson previewUntil "$preview_until" \
+      --argjson retry "$retry_json" \
+      --argjson auto "$auto_json" \
+      --argjson health "$(health_json)" \
+      --argjson digest "$(digest_json)" \
+      --argjson digestHistory "$(history_json)" \
+      --arg language "$(lang_code)" \
+      --arg languageMode "$(cfg '.language' 'auto')" \
+      --argjson config "$(config_json)" \
+      '{enabled:$enabled, pending:$pending, remainingSec:$remainingSec,
+        delaySec:$delaySec, uptimeMin:$uptimeMin, inhibitAlive:$inhibitAlive,
+        pendingToken:$pendingToken, locked:$locked, phase:$phase,
+        autoTriggered:$autoTriggered, language:$language, languageMode:$languageMode,
+        preview:{active:$previewActive, until:$previewUntil},
+        retry:$retry, auto:$auto, health:$health, digest:$digest,
+        digestHistory:$digestHistory, config:$config}'
+}
+
+do_config_json() { config_json; }
+
+do_set() {
+  (( $# == 2 )) || die "usage: omarchy-agent-ready set <config.path> <value>"
+  set_config "$1" "$2"
+  do_status_json
+}
+
+do_reset_config() {
+  reset_config
+  do_status_json
+}
+
+# ------------------------------------------------------------------- arm ----
+
+do_arm() {
+  acquire_lock
+  if is_enabled; then do_status; return 0; fi
+
+  # Re-arming restarts the countdown; drop any previous one first.
+  pending_clear
+
+  local delay token until_now
+  local auto_flag="${2:-false}" preview_flag="${3:-false}"
+  delay=${1:-$(cfg '.arm.delaySec' 3)}
+  [[ $delay =~ ^[0-9]+$ ]] || delay=3
+  (( delay < 1 )) && delay=1
+  (( delay > 300 )) && delay=300
+
+  if [[ $(cfg '.arm.enabled' true) != true ]]; then
+    log "arming disabled by config; entering immediately"
+    local trigger=manual
+    [[ $preview_flag == true ]] && trigger=preview || { [[ $auto_flag == true ]] && trigger=auto; }
+    do_on "$preview_flag" "$trigger"
+    return 0
+  fi
+
+  token=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  until_now=$(( $(date +%s) + delay ))
+  jq -nc --arg token "$token" --argjson until "$until_now" \
+      --argjson delay "$delay" --arg startedAt "$(date -Is)" \
+      --argjson autoTriggered "$auto_flag" --argjson preview "$preview_flag" \
+      '{token:$token, until:$until, delay:$delay, startedAt:$startedAt,
+        autoTriggered:$autoTriggered, preview:$preview}' \
+      >"$PENDING_FILE" || die "cannot write pending state"
+
+  [[ -r $STATE_FILE ]] || write_state false "" '{}' "off"
+  patch_state_str phase arming
+  clear_state_field healthLockFailed
+  clear_state_field retryAt
+  clear_state_field retryCount
+
+  arm_notification "$delay"      # optional desktop notification (off by default)
+  arm_bark "$delay"              # optional remote push
+  if [[ $auto_flag == true && $(cfg '.auto.barkNotify' false) == true ]]; then
+    bark_send "$(cfg '.arm.bark.title' 'Agent Ready') · $(t notify.autoBadge)" \
+              "$(t notify.barkAuto)"
+  fi
+  log "armed: ${delay}s token=$token auto=$auto_flag preview=$preview_flag (countdown driven by the bar widget)"
+
+  # No detached worker any more. The bar widget owns the countdown: while
+  # pending it polls status-json once a second and calls `_arm-fire <token>`
+  # when remainingSec reaches zero. That keeps Quickshell from spawning a
+  # long-lived child process on every click (the Surface audio pop), and
+  # removes the extra pending-file churn.
+  do_status
+}
+
+do_auto_arm() { do_arm "" true false; }
+
+do_preview() {
+  local sec; sec=$(cfg '.preview.countdownSec' 3)
+  [[ $sec =~ ^[0-9]+$ ]] || sec=3
+  do_arm "$sec" false true
+}
+
+do_reblank() {
+  acquire_lock
+  is_enabled || return 0
+  omarchy-brightness-display off >/dev/null 2>&1 || \
+    hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1 || true
+  # Refresh the snapshot so `monitorsChanged` clears and this fires once.
+  patch_state monitorIds "$(monitor_ids)"
+  log "reblanked displays (monitor set changed)"
+  do_status
+}
+
+do_digest_set() {
+  (( $# == 1 )) || die "usage: omarchy-agent-ready digest set '<json>'"
+  local tmp="$DIGEST_FILE.tmp"
+  jq -e . <<<"$1" >/dev/null 2>&1 || die "digest value is not valid JSON"
+  printf '%s\n' "$1" >"$tmp" && mv -f "$tmp" "$DIGEST_FILE" || die "cannot write digest"
+  refresh_digest
+  do_status_json
+}
+
+do_digest_get() { digest_json; }
+do_digest_history() { history_json; }
+do_digest_clear() {
+  rm -f "$DIGEST_FILE" "$HISTORY_FILE"
+  log "digest and watch history cleared"
+  do_status_json
+}
+
+do_disarm() {
+  acquire_lock
+  local was=false
+  is_pending && was=true
+  dismiss_notification
+  pending_clear
+  [[ -r $STATE_FILE ]] || write_state false "" '{}' "off"
+  patch_state_str phase off
+  if [[ $was == true ]]; then log "disarmed"; fi
+  do_status
+}
+
+do_enter_now() {
+  acquire_lock
+  local preview_flag=false trigger=manual auto_flag=false
+  if is_pending; then
+    preview_flag=$(jq -r '.preview // false' "$PENDING_FILE" 2>/dev/null || echo false)
+    auto_flag=$(jq -r '.autoTriggered // false' "$PENDING_FILE" 2>/dev/null || echo false)
+    [[ $preview_flag == true ]] && trigger=preview || { [[ $auto_flag == true ]] && trigger=auto; }
+    rm -f "$NOTIFY_ID_FILE"
+    pending_clear
+    log "enter-now requested"
+  fi
+  do_on "$preview_flag" "$trigger"
+}
+
+# Legacy detached countdown, kept only so an old CLI invocation still works.
+# The bar widget drives the countdown now (see do_arm). Firing re-checks the
+# token so a cancelled arm or a re-arm can never enter the mode.
+do_arm_worker() {
+  local token="$1" delay="$2"
+  [[ $delay =~ ^[0-9]+$ ]] || exit 0
+  sleep "$delay"
+  omarchy-agent-ready _arm-fire "$token" >/dev/null 2>&1 || true
+}
+
+do_arm_fire() {
+  local token="$1" current preview_flag=false auto_flag=false trigger=manual
+  current=$(pending_token)
+  [[ -n $current && $current == "$token" ]] || { log "arm-fire: stale token, ignoring"; return 0; }
+  preview_flag=$(jq -r '.preview // false' "$PENDING_FILE" 2>/dev/null || echo false)
+  auto_flag=$(jq -r '.autoTriggered // false' "$PENDING_FILE" 2>/dev/null || echo false)
+  [[ $preview_flag == true ]] && trigger=preview || { [[ $auto_flag == true ]] && trigger=auto; }
+  rm -f "$NOTIFY_ID_FILE"
+  pending_clear
+  log "arm fired (preview=$preview_flag trigger=$trigger)"
+  do_on "$preview_flag" "$trigger"
+}
+
+# --------------------------------------------------------------------- on ----
+
+do_on() {
+  local preview_flag="${1:-false}" trigger="${2:-}"
+  [[ -n $trigger ]] || { [[ $preview_flag == true ]] && trigger=preview || trigger=manual; }
+  acquire_lock
+
+  # A direct on (shortcut, CLI, arm worker) supersedes any pending countdown.
+  if is_pending; then
+    rm -f "$PENDING_FILE" "$NOTIFY_ID_FILE"
+    log "on called directly; pending countdown cleared"
+  fi
+
+  # Re-entrant: repair a lost inhibitor without locking the screen again.
+  if is_enabled; then
+    start_inhibit
+    patch_state_str phase active
+    log "already enabled; inhibitor reconciled"
+    do_status
+    return 0
+  fi
+
+  local now pre_stay=false old_profile="" sink="" old_muted=false old_brightness="" snapshot
+  now=$(date -Is)
+
+  # --- snapshot everything we are about to change ---
+  [[ -f $STAY_AWAKE_FILE ]] && pre_stay=true
+  old_profile=$(powerprofilesctl get 2>/dev/null || echo "")
+  sink=$(omarchy-audio-output-sink 2>/dev/null || echo "")
+  if [[ -n $sink ]] && [[ $(pactl get-sink-mute "$sink" 2>/dev/null) == *yes* ]]; then
+    old_muted=true
+  fi
+  if [[ $(cfg '.screen.dimPercent' 0) != 0 ]]; then
+    old_brightness=$(omarchy-brightness-display --no-osd 2>/dev/null || echo "")
+  fi
+
+  snapshot=$(jq -n \
+      --argjson stayAwakePreexisting "$pre_stay" \
+      --arg powerProfile "$old_profile" \
+      --arg sink "$sink" \
+      --argjson sinkMuted "$old_muted" \
+      --arg brightness "$old_brightness" \
+      '{stayAwakePreexisting:$stayAwakePreexisting, powerProfile:$powerProfile,
+        sink:$sink, sinkMuted:$sinkMuted, brightness:$brightness}')
+
+  write_state true "$now" "$snapshot" "applying"
+  patch_state_str trigger "$trigger"
+  patch_state monitorIds "$(monitor_ids)"
+
+  # 1. Block suspend (including lid close) — the core "agents stay online" bit.
+  start_inhibit
+
+  # 2. Reuse Omarchy's own Stay Awake switch so the 150s screensaver and 300s
+  #    idle lock never interrupt the session. The idle service hot-reloads it.
+  if [[ $(cfg '.idle.linkStayAwake' true) == true && $pre_stay == false ]]; then
+    omarchy-toggle-idle stay-awake >/dev/null 2>&1 || {
+      mkdir -p "$(dirname "$STAY_AWAKE_FILE")" 2>/dev/null
+      : >"$STAY_AWAKE_FILE"
+    }
+    log "linked Stay Awake on"
+  fi
+
+  # 3. Lower the power profile (balanced by default: agents stay responsive).
+  if [[ $(cfg '.powerProfile.enabled' true) == true ]]; then
+    local profile; profile=$(cfg '.powerProfile.profile' 'balanced')
+    powerprofilesctl set "$profile" >/dev/null 2>&1 && log "power profile -> $profile" \
+      || log "power profile change failed"
+  fi
+
+  # 4. Silence audio (off by default — HW_MUTE_CTRL causes pops on this machine).
+  if [[ -n $sink ]]; then
+    [[ $(cfg '.audio.mute' false) == true ]] && pactl set-sink-mute "$sink" 1 >/dev/null 2>&1 || true
+    [[ $(cfg '.audio.suspendSinks' false) == true ]] && pactl suspend-sink "$sink" 1 >/dev/null 2>&1 || true
+  fi
+
+  # 5. Optionally freeze non-essential processes (agents are allow-listed out).
+  freeze_processes
+
+  # 6. Keyboard backlight off; optional backlight dim.
+  [[ $(cfg '.screen.keyboardBacklightOff' true) == true ]] && omarchy-brightness-keyboard off >/dev/null 2>&1 || true
+  local dim; dim=$(cfg '.screen.dimPercent' 0)
+  if [[ $dim != 0 && -n $old_brightness ]]; then
+    omarchy-brightness-display --no-osd "${dim}%" >/dev/null 2>&1 || true
+  fi
+
+  # 7. Lock first, then blank the outputs. A lock failure must never leave a
+  #    half-enabled state: undo everything in place (do_off would deadlock on
+  #    our own flock) and schedule a bounded retry for the bar widget.
+  local lock_failed=false
+  if [[ $(cfg '.screen.lock' true) == true ]]; then
+    if ! omarchy-system-lock >/dev/null 2>&1; then
+      lock_failed=true
+      log "lock request failed"
+    fi
+    sleep 0.4
+  fi
+  if [[ $lock_failed == true ]]; then
+    log "rolling back to off after lock failure"
+    stop_inhibit
+    unfreeze_processes
+    if [[ $(cfg '.idle.linkStayAwake' true) == true && $pre_stay == false ]]; then
+      omarchy-toggle-idle allow-idle >/dev/null 2>&1 || true
+    fi
+    if [[ -n $old_profile && $(cfg '.powerProfile.enabled' true) == true ]]; then
+      powerprofilesctl set "$old_profile" >/dev/null 2>&1 || true
+    fi
+    [[ $(cfg '.screen.keyboardBacklightOff' true) == true ]] && \
+      omarchy-brightness-keyboard restore >/dev/null 2>&1 || true
+    write_state false "" '{}' "off"
+    patch_state lastOffAt "$(date +%s)"
+    local count retry_sec
+    count=$(state_get retryCount 0); [[ $count =~ ^[0-9]+$ ]] || count=0
+    retry_sec=$(cfg '.enter.retrySec' 60); [[ $retry_sec =~ ^[0-9]+$ ]] || retry_sec=60
+    if (( count < 3 )); then
+      patch_state healthLockFailed true
+      patch_state retryAt $(( $(date +%s) + retry_sec ))
+      patch_state retryCount $(( count + 1 ))
+      log "retry scheduled (attempt $((count + 1))/3)"
+    else
+      log "retry limit reached; staying off"
+    fi
+    do_status
+    return 1
+  fi
+  # One-time blank only. While the session lock is active `surface.lock` owns
+  # display state (it wakes the screen for face scan and re-blanks on its own
+  # timer). Never re-issue DPMS off here or from reconcile: that fights its
+  # WAKE/BLANK state machine and breaks face unlock.
+  if [[ $(cfg '.screen.dpmsOff' true) == true ]]; then
+    omarchy-brightness-display off >/dev/null 2>&1 || \
+      hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1 || true
+  fi
+
+  patch_state_str phase active
+  clear_state_field healthLockFailed
+  clear_state_field retryAt
+  clear_state_field retryCount
+  if [[ $preview_flag == true ]]; then
+    local preview_sec; preview_sec=$(cfg '.preview.durationSec' 20)
+    [[ $preview_sec =~ ^[0-9]+$ ]] || preview_sec=20
+    patch_state previewActive true
+    patch_state previewUntil $(( $(date +%s) + preview_sec ))
+    log "preview active for ${preview_sec}s"
+  fi
+
+  run_hooks "$CONFIG_DIR/enter.d" enter
+  refresh_digest
+  notify "$(cfg '.label' 'Agent Ready')" "$(t notify.enter)"
+  log "enabled"
+  do_status
+}
+
+# -------------------------------------------------------------------- off ----
+
+do_off() {
+  acquire_lock
+
+  if ! is_enabled; then
+    do_status
+    return 0
+  fi
+
+  patch_state_str phase restoring
+  local snap pre_stay old_profile sink old_muted old_brightness
+  # Capture the watch identity BEFORE write_state clears it. Passing these in
+  # keeps history recording independent of the state file's later contents.
+  local watch_since watch_trigger
+  watch_since=$(state_get since "")
+  watch_trigger=$(state_get trigger manual)
+  snap=$(jq -c '.snapshot // {}' "$STATE_FILE" 2>/dev/null || echo '{}')
+  pre_stay=$(jq -r '.stayAwakePreexisting // false' <<<"$snap")
+  old_profile=$(jq -r '.powerProfile // ""' <<<"$snap")
+  sink=$(jq -r '.sink // ""' <<<"$snap")
+  old_muted=$(jq -r '.sinkMuted // false' <<<"$snap")
+  old_brightness=$(jq -r '.brightness // ""' <<<"$snap")
+
+  # 1. Bring the display back first so the restore is visible.
+  [[ $(cfg '.screen.dpmsOff' true) == true ]] && omarchy-brightness-display on >/dev/null 2>&1 || true
+  [[ $(cfg '.screen.keyboardBacklightOff' true) == true ]] && omarchy-brightness-keyboard restore >/dev/null 2>&1 || true
+  if [[ -n $old_brightness ]]; then
+    omarchy-brightness-display --no-osd "${old_brightness}%" >/dev/null 2>&1 || true
+  fi
+
+  # 2. Restore audio.
+  if [[ -n $sink ]]; then
+    [[ $(cfg '.audio.suspendSinks' false) == true ]] && pactl suspend-sink "$sink" 0 >/dev/null 2>&1 || true
+    if [[ $(cfg '.audio.mute' false) == true ]]; then
+      if [[ $old_muted == true ]]; then pactl set-sink-mute "$sink" 1 >/dev/null 2>&1 || true
+      else pactl set-sink-mute "$sink" 0 >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  # 3. Restore the power profile we found on the way in.
+  if [[ -n $old_profile && $(cfg '.powerProfile.enabled' true) == true ]]; then
+    powerprofilesctl set "$old_profile" >/dev/null 2>&1 || true
+  fi
+
+  # 4. Unfreeze, release the suspend block, restore Stay Awake.
+  unfreeze_processes
+  stop_inhibit
+  if [[ $(cfg '.idle.linkStayAwake' true) == true && $pre_stay == false ]]; then
+    omarchy-toggle-idle allow-idle >/dev/null 2>&1 || rm -f "$STAY_AWAKE_FILE"
+    log "restored Stay Awake off"
+  fi
+
+  write_state false "" '{}' "off"
+  patch_state lastOffAt "$(date +%s)"
+  clear_state_field previewActive
+  clear_state_field previewUntil
+  run_hooks "$CONFIG_DIR/leave.d" leave
+  refresh_digest "$watch_since"          # uptimeMin is correct with the saved start
+  record_digest_history "$watch_since" "$watch_trigger"
+  notify "$(cfg '.label' 'Agent Ready')" "$(t notify.leave)"
+  log "disabled"
+  do_status
+}
+
+do_toggle() {
+  if is_pending; then do_disarm        # click again during countdown = cancel
+  elif is_enabled; then do_off
+  else do_arm
+  fi
+}
+
+# ------------------------------------------------------------------ doctor ----
+
+do_doctor() {
+  local dep missing=0
+  printf 'Agent Ready — doctor\n\n'
+  printf '  config      %s (%s)\n' "$CONFIG_FILE" "$([[ -r $CONFIG_FILE ]] && echo present || echo MISSING)"
+  printf '  state dir   %s\n' "$STATE_DIR"
+  printf '  state       %s\n' "$(is_enabled && echo ON || echo OFF)"
+  printf '  inhibitor   %s\n' "$(inhibit_alive && echo alive || echo 'not running')"
+
+  printf '\n  dependencies\n'
+  for dep in jq pactl powerprofilesctl systemd-inhibit hyprctl brightnessctl \
+             omarchy-system-lock omarchy-brightness-display omarchy-brightness-keyboard \
+             omarchy-toggle-idle omarchy-audio-output-sink omarchy-notification-send flock nohup; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      printf '    ok        %s\n' "$dep"
+    else
+      printf '    MISSING   %s\n' "$dep"; missing=1
+    fi
+  done
+
+  printf '\n  planned actions on "on"\n'
+  printf '    arming    enabled=%s delay=%ss notify=%s enterNow=%s\n' \
+    "$(cfg '.arm.enabled' true)" "$(cfg '.arm.delaySec' 10)" \
+    "$(cfg '.arm.notify' true)" "$(cfg '.arm.allowEnterNow' true)"
+  printf '    inhibit   %s / %s (enabled=%s)\n' \
+    "$(cfg '.inhibit.what' 'sleep:idle')" "$(cfg '.inhibit.mode' 'block')" "$(cfg '.inhibit.enabled' true)"
+  printf '    idle      link Stay Awake = %s (currently %s)\n' \
+    "$(cfg '.idle.linkStayAwake' true)" "$([[ -f $STAY_AWAKE_FILE ]] && echo on || echo off)"
+  printf '    power     %s -> %s (enabled=%s)\n' \
+    "$(powerprofilesctl get 2>/dev/null || echo '?')" "$(cfg '.powerProfile.profile' balanced)" "$(cfg '.powerProfile.enabled' true)"
+  printf '    screen    lock=%s dpmsOff=%s kbdBacklightOff=%s dim=%s%%\n' \
+    "$(cfg '.screen.lock' true)" "$(cfg '.screen.dpmsOff' true)" \
+    "$(cfg '.screen.keyboardBacklightOff' true)" "$(cfg '.screen.dimPercent' 0)"
+  printf '    audio     mute=%s suspendSinks=%s (sink: %s)\n' \
+    "$(cfg '.audio.mute' false)" "$(cfg '.audio.suspendSinks' false)" \
+    "$(omarchy-audio-output-sink 2>/dev/null || echo '?')"
+  printf '    freeze    enabled=%s\n' "$(cfg '.freeze.enabled' false)"
+
+  local at; at=$(auto_threshold)
+  printf '\n  language / automatic / digest\n'
+  printf '    language  mode=%s effective=%s catalogs=%s\n' \
+    "$(cfg '.language' 'auto')" "$(lang_code)" "$I18N_DIR"
+  printf '    auto      enabled=%s threshold=%ss available=%s cooldown=%ss bark=%s\n' \
+    "$(cfg '.auto.enabled' true)" "$(jq -r '.thresholdSec' <<<"$at")" \
+    "$(jq -r '.available' <<<"$at")" "$(cfg '.auto.cooldownSec' 60)" \
+    "$(cfg '.auto.barkNotify' false)"
+  printf '    preview   countdown=%ss duration=%ss  retry=%ss\n' \
+    "$(cfg '.preview.countdownSec' 3)" "$(cfg '.preview.durationSec' 20)" "$(cfg '.enter.retrySec' 60)"
+  printf '    digest    enabled=%s current=%s history=%s records\n' \
+    "$(cfg '.digest.enabled' true)" "$(digest_json | jq -c .)" \
+    "$(history_json | jq 'length')"
+  printf '    health    %s\n' "$(health_json | jq -c .)"
+
+  load_agent_allow
+  printf '\n  agent allow list (%d): %s\n' "${#AGENT_ALLOW[@]}" "${AGENT_ALLOW[*]}"
+  printf '  hooks       %s enter.d, %s leave.d\n' \
+    "$(find "$CONFIG_DIR/enter.d" -maxdepth 1 -name '*.sh' -type f 2>/dev/null | wc -l)" \
+    "$(find "$CONFIG_DIR/leave.d" -maxdepth 1 -name '*.sh' -type f 2>/dev/null | wc -l)"
+  printf '\n'
+  (( missing == 0 )) || { printf 'Some dependencies are missing.\n' >&2; return 1; }
+}
+
+do_edit() {
+  local editor="${EDITOR:-vi}"
+  bash -lc "$editor \"$CONFIG_FILE\"" >/dev/null 2>&1 &
+}
+
+# ------------------------------------------------------------------- main ----
+
+case "${1:-status}" in
+  status|--status)   do_status ;;
+  on|enable)         do_on "${2:-false}" ;;
+  off|disable)       do_off ;;
+  toggle)            do_toggle ;;
+  arm)               do_arm "${2:-}" ;;
+  auto-arm)          do_auto_arm ;;
+  preview)           do_preview ;;
+  reblank)           do_reblank ;;
+  disarm|cancel)     do_disarm ;;
+  enter-now)         do_enter_now ;;
+  status-json)       do_status_json ;;
+  config-json)       do_config_json ;;
+  set)               shift; do_set "$@" ;;
+  reset-config)      do_reset_config ;;
+  digest)            case "${2:-}" in
+                       set) shift 2; do_digest_set "${1:-}" ;;
+                       get) do_digest_get ;;
+                       history) do_digest_history ;;
+                       clear) do_digest_clear ;;
+                       *) die "usage: omarchy-agent-ready digest set|get|history|clear" ;;
+                     esac ;;
+  doctor|check)      do_doctor ;;
+  lang)              lang_code; printf '\n' ;;
+  edit|config)       do_edit ;;
+  _arm-worker)       shift; do_arm_worker "$@" ;;
+  _arm-fire)         shift; do_arm_fire "$@" ;;
+  -h|--help|help)    usage ;;
+  *)                 usage >&2; exit 2 ;;
+esac

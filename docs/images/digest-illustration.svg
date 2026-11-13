@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="630" viewBox="0 0 560 630" role="img" aria-labelledby="title desc">
+  <title id="title">Watch digest — static illustration</title>
+  <desc id="desc">Fictional example data, not a real watch record. No power scene was entered to make this illustration.</desc>
+  <rect width="560" height="630" rx="12" fill="#191c27"/>
+  <rect x="2" y="2" width="556" height="626" rx="10" fill="none" stroke="#a8b6e3" stroke-width="2"/>
+  <g font-family="monospace" fill="#c4cce7">
+    <text x="28" y="42" font-size="17" font-weight="bold">STATIC ILLUSTRATION · FICTIONAL DATA</text>
+    <text x="28" y="94" font-size="24" font-weight="bold">Agent Ready / Watch digest</text>
+    <text x="28" y="126" font-size="15">Example layout — not a desktop screenshot</text>
+    <path d="M28 148H532" stroke="#45495c"/>
+    <rect x="28" y="172" width="504" height="330" rx="6" fill="none" stroke="#666e8a"/>
+    <g font-size="17">
+      <text x="48" y="208" font-weight="bold">Watch #1</text>
+      <text x="48" y="240">2026-11-13 10:00 → 12:30</text>
+      <text x="48" y="272">Duration: 2h 30m</text>
+      <text x="48" y="304">Trigger: manual</text>
+      <text x="48" y="336">Agents: example-agent</text>
+      <text x="48" y="368">Measures: inhibit sleep, lock, DPMS</text>
+      <text x="48" y="400">Power profile: balanced</text>
+      <text x="48" y="432">Completed: 3 · Failed: 0</text>
+      <text x="48" y="464">Note: fictional demonstration only</text>
+    </g>
+    <rect x="28" y="526" width="244" height="46" fill="none" stroke="#8793b7"/>
+    <rect x="288" y="526" width="244" height="46" fill="none" stroke="#8793b7"/>
+    <text x="150" y="555" text-anchor="middle" font-size="17">Back</text>
+    <text x="410" y="555" text-anchor="middle" font-size="17">Assign again</text>
+    <text x="28" y="607" font-size="14">No real session, history or runtime data used.</text>
+  </g>
+</svg>

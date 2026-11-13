@@ -1,0 +1,23 @@
+#!/bin/bash
+# Example hook — rename to `example-digest.sh` to enable.
+#
+# Called by `run_hooks` after Agent Ready finishes entering. Use it to feed
+# the watch digest with data from your own tools (Cindy sessions, backups,
+# Home Assistant, task queues, ...). The digest is displayed automatically
+# when you unlock and return to the desktop.
+#
+# Available: AGENT_READY_ACTION, AGENT_READY_CONFIG_DIR, AGENT_READY_STATE_DIR,
+#            AGENT_READY_STATE_FILE.
+
+set -u
+
+# Example: record that a nightly job started. Replace with your own logic.
+omarchy-agent-ready digest set "$(jq -nc \
+  --arg note "值守开始于 $(date '+%H:%M')" \
+  '{completed:0, failed:0, pending:[], note:$note}')" >/dev/null 2>&1 || true
+
+# Example: push to Bark (fill in your own endpoint).
+# curl -sS --max-time 5 -G \
+#   --data-urlencode "title=Agent Ready" \
+#   --data-urlencode "body=值守已开始" \
+#   "https://your-nas/bark/YOUR_KEY" >/dev/null 2>&1 || true

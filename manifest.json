@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "eclipse.agent-ready",
+  "name": "Agent Ready",
+  "version": "1.1.0",
+  "author": "menmer0859",
+  "license": "MIT",
+  "description": "Agents-on-duty power scene with countdown, idle auto-arm, digest history, per-plugin language selection, and configurable power and digest switches.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Ready",
+    "description": "Countdown bar switch with idle auto-arm, full watch digest history, language selection, and power/digest toggles in an Omarchy-kit settings panel.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "panelWidth": 340
+    },
+    "schema": [
+      {
+        "key": "panelWidth",
+        "type": "number",
+        "label": "Settings panel width (px)",
+        "defaultValue": 340,
+        "min": 280,
+        "max": 520,
+        "step": 20
+      }
+    ]
+  }
+}
