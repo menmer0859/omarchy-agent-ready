@@ -1,9 +1,8 @@
 ---
 title: Agent Ready CLI and configuration reference
 type: cli-reference
-date: 2026-11-13
-status: release-preparation
-canonical_path: /home/eclipse/omarchy-agent-ready-release/docs/CLI.md
+date: 2026-11-21
+status: release-verified
 ---
 
 # Agent Ready — CLI and configuration reference
@@ -11,7 +10,8 @@ canonical_path: /home/eclipse/omarchy-agent-ready-release/docs/CLI.md
 ## TLDR
 
 For developers and users configuring Agent Ready **1.1.0**: the release author is
-**menmer0859**, the repository is https://github.com/menmer0859/omarchy-agent-ready
+**Haomeng Kang (GitHub: `menmer0859`)**, the repository is
+https://github.com/menmer0859/omarchy-agent-ready
 (clone: https://github.com/menmer0859/omarchy-agent-ready.git), and the plugin id
 remains **`eclipse.agent-ready`**.
 
@@ -26,15 +26,14 @@ Hooks can supply a precise `agents` array using `digest set` instead.
 ## Evidence and path conventions
 
 The configuration template is
-`/home/eclipse/omarchy-agent-ready-release/config/config.json`; detection and
+`config/config.json`; detection and
 freeze protection are implemented separately in
-`/home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready`
+`bin/omarchy-agent-ready`
 (`agent_names`, `load_agent_allow`, `is_agent_cmd`). Release defaults above are
 the publication baseline, not a claim of new live-system verification.
 
-Repository references use `/home/eclipse/omarchy-agent-ready-release` as the
-absolute local checkout. Installed paths use `$HOME`, which the shell expands
-to **the installing user's own absolute home**, not the author's `/home/eclipse`.
+Repository references are relative to the repository root. Installed paths use
+`$HOME`, which the shell expands to **the installing user's own absolute home**.
 Surface audio and `surface.lock` observations below are author-machine history,
 not requirements for other machines. Operational examples below are documentation;
 commands that arm, preview, modify state or control power require an appropriate
@@ -78,9 +77,9 @@ This writes digest state; it does not change process detection or freeze protect
 
 ## Path index
 
-- Developer history and pitfalls: `/home/eclipse/omarchy-agent-ready-release/docs/DEVELOPMENT.md`.
-- Widget internals: `/home/eclipse/omarchy-agent-ready-release/docs/PLUGIN.md`.
-- User installation guide: `/home/eclipse/omarchy-agent-ready-release/README.md`.
+- Developer history and pitfalls: `docs/DEVELOPMENT.md`.
+- Widget internals: `docs/PLUGIN.md`.
+- User installation guide: `README.md`.
 - Installed configuration: `$HOME/.config/omarchy/agent-ready/config.json`.
 
 ## Overview
@@ -300,8 +299,8 @@ that into its own `PluginI18n` (a `Commons.Translations` twin with a writable
 
 All strings come from one place: the plugin's
 `$HOME/.config/omarchy/plugins/eclipse.agent-ready/i18n/*.json` catalogs
-(`/home/eclipse/omarchy-agent-ready-release/i18n/en.json` and
-`/home/eclipse/omarchy-agent-ready-release/i18n/zh-CN.json` in the checkout). The CLI resolves regional codes against the
+(`i18n/en.json` and
+`i18n/zh-CN.json` in the checkout). The CLI resolves regional codes against the
 catalogs that exist (base language → English → key), substitutes `%1`/`%2`
 placeholders, and honours `OMARCHY_LANGUAGE_FILE` as a test override (it takes
 precedence over the plugin setting). `omarchy-agent-ready lang` prints the
@@ -314,8 +313,8 @@ Notification templates can still be overridden per string with `.labels.*` in
 `$HOME/.config/omarchy/agent-ready/config.json` (see the table below). An override is used verbatim (legacy `%S`
 = seconds, `%A` = action summary), so write it in the language you want. Left
 empty — the default — the localized catalogs win. To add a third language,
-copy `/home/eclipse/omarchy-agent-ready-release/i18n/en.json` to
-`/home/eclipse/omarchy-agent-ready-release/i18n/<code>.json`, translate it, and either set
+copy `i18n/en.json` to
+`i18n/<code>.json`, translate it, and either set
 `.language` to that code or add it to the panel's picker.
 
 ## Status bar
@@ -339,7 +338,7 @@ is translated through `$HOME/.config/omarchy/plugins/eclipse.agent-ready/i18n/`.
 information bar pinned to the top while the sections scroll beneath it.
 Everything you change writes to `$HOME/.config/omarchy/agent-ready/config.json` immediately; most settings apply
 the next time the mode turns on, while the **Language** picker and the digest
-switch apply at once. See [PLUGIN.md](PLUGIN.md) (`/home/eclipse/omarchy-agent-ready-release/docs/PLUGIN.md` on the author's machine) for the widget's conventions.
+switch apply at once. See [PLUGIN.md](PLUGIN.md) (`docs/PLUGIN.md` on the author's machine) for the widget's conventions.
 
 All CLI calls from the plugin go through **argv-vector `Process` objects**
 (no shell, no login shell, no `execDetached`), serialized through a small

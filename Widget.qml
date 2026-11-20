@@ -79,10 +79,18 @@ BarWidget {
     console.log("Agent Ready language:", language, "·", strings.t("section.language"))
   })
 
-  readonly property bool showArming: root.arming && !root.popupOpen && !root.digestOpen
-  readonly property bool showDigest: root.digestOpen && !root.arming
-  readonly property bool showSettings: root.popupOpen && !root.arming
-  readonly property bool cardOpen: root.arming || root.digestOpen || root.popupOpen
+  // Single face selector: exactly one of closed/settings/arming/digest is
+  // visible, so contradictory boolean combinations can never open a blank card.
+  // Settings wins while the panel is open (its hero already shows the arming
+  // countdown and its primary button becomes Cancel); otherwise an arming
+  // countdown takes precedence over the digest face.
+  readonly property string face: root.popupOpen ? "settings"
+      : root.arming ? "arming"
+      : root.digestOpen ? "digest" : "closed"
+  readonly property bool showArming: root.face === "arming"
+  readonly property bool showDigest: root.face === "digest"
+  readonly property bool showSettings: root.face === "settings"
+  readonly property bool cardOpen: root.face !== "closed"
 
   readonly property bool autoEnabled: root.autoInfo.enabled !== false
   readonly property bool autoAvailable: root.autoInfo.available !== false
@@ -119,7 +127,7 @@ BarWidget {
     if (cfgGet(".audio.mute", false) === true) p.push(strings.t("summary.mute"))
     if (cfgGet(".powerProfile.enabled", true) === true) p.push(strings.t("summary.power"))
     p.push(strings.t("summary.agents"))
-    return p.join("、")
+    return p.join(strings.t("notify.sep"))
   }
 
   // ---- watch history formatting (all records are language-neutral) ----
@@ -151,6 +159,14 @@ BarWidget {
     return out
   }
 
+  function profileLabel(code) {
+    var raw = String(code)
+    var key = raw
+    if (raw === "power-saver" || raw === "powerSaver" || raw === "power_saver") key = "powerSaver"
+    else if (raw !== "balanced" && raw !== "performance") return raw
+    return strings.t("profile." + key, raw)
+  }
+
   // One record -> a multi-line, fully localised description.
   function digestRecordLines(r) {
     if (!r || typeof r !== "object") return ""
@@ -163,16 +179,16 @@ BarWidget {
         .arg(strings.t("digest.trigger." + trig, strings.t("digest.trigger.manual"))))
     var agents = Array.isArray(r.agents) ? r.agents : []
     lines.push(strings.t("digest.agentsNames")
-        .arg(agents.length > 0 ? agents.join("、") : strings.t("digest.agentsNone")))
+        .arg(agents.length > 0 ? agents.join(strings.t("notify.sep")) : strings.t("digest.agentsNone")))
     var acts = actionLabels(r.actions)
-    if (acts.length > 0) lines.push(strings.t("digest.actions").arg(acts.join("、")))
-    if (r.powerProfile) lines.push(strings.t("digest.power").arg(String(r.powerProfile)))
+    if (acts.length > 0) lines.push(strings.t("digest.actions").arg(acts.join(strings.t("notify.sep"))))
+    if (r.powerProfile) lines.push(strings.t("digest.power").arg(root.profileLabel(r.powerProfile)))
     if (r.completed !== undefined && r.completed !== null)
       lines.push(strings.t("digest.completed").arg(Number(r.completed) || 0))
     if (r.failed !== undefined && r.failed !== null)
       lines.push(strings.t("digest.failed").arg(Number(r.failed) || 0))
     if (Array.isArray(r.pending) && r.pending.length > 0)
-      lines.push(strings.t("digest.pending").arg(r.pending.join("；")))
+      lines.push(strings.t("digest.pending").arg(r.pending.join(strings.t("notify.sep"))))
     if (typeof r.note === "string" && r.note.length > 0)
       lines.push(strings.t("digest.note").arg(r.note))
     if (typeof r.lastEvent === "string" && r.lastEvent.length > 0)
@@ -273,6 +289,10 @@ BarWidget {
     if (incomingToken !== root.pendingToken) root.fireInFlight = false
     root.pendingToken = incomingToken
 
+    // Arming always closes the digest face so the countdown (or the settings
+    // panel's arming hero) is what the user sees, never a stale digest.
+    if (root.arming && root.digestOpen) root.digestOpen = false
+
     if (s.config && (!root.popupOpen || Object.keys(root.cfg).length === 0))
       root.cfg = s.config
     if (!root.arming) root.fireInFlight = false
@@ -312,10 +332,13 @@ BarWidget {
 
   function triggerAutoArm() {
     if (root.arming || root.activeState || root.phase !== "off" || !root.stateLoaded) return
+    // The monitor stays enabled during an auto countdown (for input-cancel),
+    // so guard against re-arming here as well as in the CLI's pending dedupe.
+    if (root.popupOpen || root.digestOpen || root.previewActive) return
     root.runCommand([root.cli, "auto-arm"])
   }
 
-  function cancelAutoArmOnInput() {
+  function disarmAutoCountdown() {
     if (root.arming && root.autoTriggered && root.disarmOnInput)
       root.runCommand([root.cli, "disarm"])
   }
@@ -375,16 +398,27 @@ BarWidget {
   // disabled by the Stay Awake marker once the scene is active). The threshold
   // comes from status-json: a fixed value, or the system screensaver time minus
   // the countdown and a safety buffer.
+  //
+  // The monitor MUST stay enabled during an auto-triggered countdown when
+  // disarmOnInput is on: disabling it would clear isIdle and both lose real
+  // input events and fire a spurious cancel. Re-triggering is prevented by the
+  // guards in triggerAutoArm(), not by turning the monitor off.
+  //
+  // While idle (the common case during a countdown) input is a real cancel, so
+  // it cancels directly. While still idling, onIsIdleChanged false is not a
+  // user event and must not fire.
   IdleMonitor {
     id: autoIdle
     enabled: root.stateLoaded && root.autoEnabled && root.autoAvailable
-             && root.phase === "off" && !root.arming && !root.popupOpen
-             && !root.digestOpen && root.autoCooldown <= 0 && !root.previewActive
+             && !root.popupOpen && !root.digestOpen
+             && root.autoCooldown <= 0 && !root.previewActive
+             && ((root.phase === "off" && !root.arming)
+                 || (root.arming && root.autoTriggered && root.disarmOnInput))
     timeout: Math.max(1, root.autoThresholdSec)
     respectInhibitors: root.requireInhibitorsClear
     onIsIdleChanged: {
       if (isIdle) root.triggerAutoArm()
-      else root.cancelAutoArmOnInput()
+      else if (!isIdle) root.disarmAutoCountdown()
     }
   }
 
@@ -417,7 +451,9 @@ BarWidget {
       if (root.arming) return strings.t("tooltip.arming").arg(root.remainingSec)
       if (root.activeState) {
         var d = root.digest || ({})
-        return root.inhibitAlive
+        // A user-disabled inhibitor is not a fault; only a configured-but-lost
+        // barrier is degraded.
+        return (root.inhibitAlive || root.health.inhibitor === "disabled")
           ? strings.t("tooltip.activeDigest").arg(Number(d.agentsOnline) || 0)
           : strings.t("tooltip.degraded")
       }
@@ -768,7 +804,8 @@ BarWidget {
             textFormat: Text.PlainText
             text: root.arming ? strings.t("hero.arming").arg(root.remainingSec)
                 : root.activeState
-                    ? (root.inhibitAlive ? strings.t("hero.active") : strings.t("hero.degraded"))
+                    ? ((root.inhibitAlive || root.health.inhibitor === "disabled")
+                        ? strings.t("hero.active") : strings.t("hero.degraded"))
                     : strings.t("hero.off")
             color: Qt.darker(root.fg, 1.4)
             font.family: root.fontFam

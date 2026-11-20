@@ -12,11 +12,15 @@ This plugin is built the way Omarchy's own bar panels are:
   `bar`, `moduleName` and `settings` injected by the host.
 - **`WidgetButton`** for the bar icon: shared tooltip, press feedback, theme
   colors and the `pressed(int button)` signal (left / right / middle).
-- **One `PopupCard` with two faces** — an arming card while a countdown runs,
-  the settings panel otherwise. It grows out of the icon and fades using
+- **One `PopupCard` with three faces** — an arming card while a countdown runs,
+  the settings panel otherwise, and a digest face when a watch is being shown.
+  It grows out of the icon and fades using
   `Style.duration`, anchors to the bar, and registers with
   `bar.requestPopout` / `releasePopout` so only one popup is open at a time.
   No hand-written open/close animation, and no two competing popups.
+- **A single face selector** (`settings / arming / digest / closed`) drives the
+  visible face and the card's open state, so contradictory boolean combinations
+  cannot open an empty popup.
 - **Kit content components**: `PanelSectionHeader`, `PanelSeparator`, `Toggle`,
   `NumberField`, `Button`, `QQC.ScrollView` — all theme-driven through `Style`
   tokens and `Commons.Color`. Mutually-exclusive option rows (power profile,

@@ -26,6 +26,7 @@ PENDING_FILE="$STATE_DIR/pending.json"
 NOTIFY_ID_FILE="$STATE_DIR/notify.id"
 DIGEST_FILE="$STATE_DIR/digest.json"
 HISTORY_FILE="$STATE_DIR/history.json"
+AUTO_STATE_FILE="$STATE_DIR/auto.json"
 FROZEN_FILE="$STATE_DIR/frozen.pids"
 LOCK_FILE="$STATE_DIR/lock"
 LOG_FILE="$STATE_DIR/log"
@@ -41,6 +42,10 @@ I18N_DIR="${AGENT_READY_I18N_DIR:-$HOME/.config/omarchy/plugins/eclipse.agent-re
 LANGUAGE_FILE="${OMARCHY_LANGUAGE_FILE:-$HOME/.config/omarchy/language}"
 declare -A _I18N=()
 _I18N_LOADED=0
+# Signal helper. Tests may point this at a logging/failing stub so a failed
+# inhibit/freeze release can be exercised deterministically without touching a
+# real process tree. Default "kill" resolves to the builtin.
+KILL_BIN="${AGENT_READY_KILL_BIN:-kill}"
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
@@ -416,6 +421,31 @@ clear_state_field() {
   fi
 }
 
+# Record one field of the applied-actions snapshot. The snapshot is the single
+# source of truth for what off/rollback must undo — never the live config,
+# which the user may have edited while the scene was active. Dotted keys address
+# nested fields (e.g. applied.inhibit) via setpath, not a literal flat key.
+patch_snapshot() {
+  local key="$1" value="$2" tmp="$STATE_FILE.tmp"
+  [[ -r $STATE_FILE ]] || return 0
+  if jq --arg k "$key" --argjson v "$value" \
+       '.snapshot |= setpath($k | split("."); $v)' "$STATE_FILE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+snap_get() {
+  local snap key default
+  snap=$(jq -c '.snapshot // {}' "$STATE_FILE" 2>/dev/null || echo '{}')
+  key="$1"; default="${2:-}"
+  local v
+  v=$(jq -r --arg k "$key" --arg d "$default" \
+        'getpath($k | split(".")) // $d' <<<"$snap" 2>/dev/null) || v="$default"
+  printf '%s' "$v"
+}
+
 state_get() {
   [[ -r $STATE_FILE ]] || { printf '%s' "$2"; return 0; }
   local v; v=$(jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null) || v=""
@@ -598,7 +628,11 @@ health_json() {
   local ids_now='[]' ids_saved='[]' changed=false
   is_enabled && enabled=true
   if [[ $enabled == true ]]; then
-    inhibit_alive || inhibitor=lost
+    if [[ $(cfg '.inhibit.enabled' true) == true ]]; then
+      inhibit_alive || inhibitor=lost
+    else
+      inhibitor=disabled
+    fi
     lr=$(LC_ALL=C.UTF-8 timeout 1 omarchy-shell lock status 2>/dev/null | grep -m1 '^{') || lr=""
     if [[ -n $lr ]]; then
       ll=$(jq -r 'if has("locked") then .locked else false end' <<<"$lr" 2>/dev/null) || ll=false
@@ -639,9 +673,20 @@ inhibit_alive() {
   local pid cmd
   IFS= read -r pid <"$INHIBIT_PID_FILE" || return 1
   [[ $pid =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+  "$KILL_BIN" -0 "$pid" 2>/dev/null || return 1
   cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 1
   [[ $cmd == *omarchy-agent-ready-inhibit* ]]
+}
+
+# Wait briefly for a PID to exit. Used to confirm an inhibitor/agent process
+# actually went away before we clear its recovery record.
+pid_gone() {
+  local pid="$1" i
+  for (( i = 0; i < 10; i++ )); do
+    "$KILL_BIN" -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
 }
 
 start_inhibit() {
@@ -664,16 +709,37 @@ start_inhibit() {
   sleep 0.2
   if inhibit_alive; then
     log "inhibit started pid=$pid what=$what mode=$mode"
-  else
-    log "WARNING inhibit pid=$pid did not stay alive; suspend is NOT blocked"
+    return 0
   fi
+  log "WARNING inhibit pid=$pid did not stay alive; suspend is NOT blocked"
+  rm -f "$INHIBIT_PID_FILE"
+  return 1
 }
 
 stop_inhibit() {
   [[ -r $INHIBIT_PID_FILE ]] || return 0
   local pid=""
   IFS= read -r pid <"$INHIBIT_PID_FILE" || true
-  [[ ${pid:-} =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null || true
+  if [[ ${pid:-} =~ ^[0-9]+$ ]]; then
+    if "$KILL_BIN" -0 "$pid" 2>/dev/null; then
+      local cmd=""
+      cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || cmd=""
+      if [[ $cmd == *omarchy-agent-ready-inhibit* ]]; then
+        if ! "$KILL_BIN" "$pid" 2>/dev/null; then
+          log "WARNING inhibit release failed (pid=$pid); keeping PID record"
+          return 1
+        fi
+        if ! pid_gone "$pid"; then
+          log "WARNING inhibit still alive after SIGTERM (pid=$pid); keeping PID record"
+          return 1
+        fi
+      else
+        log "WARNING inhibit PID $pid reused by another process; dropping stale record"
+      fi
+    else
+      log "inhibit process already gone (pid=$pid)"
+    fi
+  fi
   rm -f "$INHIBIT_PID_FILE"
   log "inhibit stopped"
 }
@@ -687,8 +753,7 @@ load_agent_allow() {
   while IFS= read -r item; do
     [[ -n $item ]] && AGENT_ALLOW+=("${item,,}")
   done < <(cfg_array '.agents.allow')
-  # An empty list is intentional: no machine-specific implicit defaults.
-  # Configure agents.allow for this machine before enabling process freezing.
+  # An explicitly empty list means no detected names and no freeze exemptions.
 }
 
 # Used to make sure a "non-essential process" freeze never touches an agent.
@@ -722,11 +787,23 @@ freeze_processes() {
 
 unfreeze_processes() {
   [[ -r $FROZEN_FILE ]] || return 0
-  local pid
+  local pid failed=false remaining=""
   while IFS= read -r pid; do
     [[ $pid =~ ^[0-9]+$ ]] || continue
-    kill -CONT "$pid" 2>/dev/null || true
+    if "$KILL_BIN" -CONT "$pid" 2>/dev/null; then
+      log "resumed pid=$pid"
+    else
+      # Keep the record of anything we could not resume so a later off/retry
+      # can still find it; never silently drop recovery evidence.
+      log "WARNING resume failed for pid=$pid; keeping frozen record"
+      remaining+="$pid"$'\n'
+      failed=true
+    fi
   done <"$FROZEN_FILE"
+  if [[ $failed == true ]]; then
+    printf '%s' "$remaining" >"$FROZEN_FILE"
+    return 1
+  fi
   rm -f "$FROZEN_FILE"
 }
 
@@ -935,11 +1012,21 @@ do_arm() {
   acquire_lock
   if is_enabled; then do_status; return 0; fi
 
+  local delay token until_now
+  local auto_flag="${2:-false}" preview_flag="${3:-false}"
+
+  # Multi-monitor dedupe: every screen owns an IdleMonitor, so several instances
+  # can call auto-arm for the same idle event. Under the action lock, a pending
+  # countdown already exists -> no-op (manual re-arm below still restarts it).
+  if [[ $auto_flag == true ]] && is_pending; then
+    log "auto-arm ignored: countdown already pending"
+    do_status
+    return 0
+  fi
+
   # Re-arming restarts the countdown; drop any previous one first.
   pending_clear
 
-  local delay token until_now
-  local auto_flag="${2:-false}" preview_flag="${3:-false}"
   delay=${1:-$(cfg '.arm.delaySec' 3)}
   [[ $delay =~ ^[0-9]+$ ]] || delay=3
   (( delay < 1 )) && delay=1
@@ -949,7 +1036,7 @@ do_arm() {
     log "arming disabled by config; entering immediately"
     local trigger=manual
     [[ $preview_flag == true ]] && trigger=preview || { [[ $auto_flag == true ]] && trigger=auto; }
-    do_on "$preview_flag" "$trigger"
+    do_on_locked "$preview_flag" "$trigger"
     return 0
   fi
 
@@ -1027,7 +1114,9 @@ do_disarm() {
   dismiss_notification
   pending_clear
   [[ -r $STATE_FILE ]] || write_state false "" '{}' "off"
-  patch_state_str phase off
+  # Only cancel an inactive pending arm. A late disarm arriving after entry
+  # must not rewrite an active scene's phase to off.
+  if ! is_enabled; then patch_state_str phase off; fi
   if [[ $was == true ]]; then log "disarmed"; fi
   do_status
 }
@@ -1043,7 +1132,7 @@ do_enter_now() {
     pending_clear
     log "enter-now requested"
   fi
-  do_on "$preview_flag" "$trigger"
+  do_on_locked "$preview_flag" "$trigger"
 }
 
 # Legacy detached countdown, kept only so an old CLI invocation still works.
@@ -1057,24 +1146,35 @@ do_arm_worker() {
 }
 
 do_arm_fire() {
-  local token="$1" current preview_flag=false auto_flag=false trigger=manual
+  local token="${1:-}" current preview_flag=false auto_flag=false trigger=manual
+  # Validate + consume the token and enter under ONE action lock, so a
+  # concurrent disarm cannot slip in between validation and entry, and two
+  # monitor instances cannot both pass the pre-check.
+  acquire_lock
   current=$(pending_token)
-  [[ -n $current && $current == "$token" ]] || { log "arm-fire: stale token, ignoring"; return 0; }
+  [[ -n $current && $current == "$token" ]] || { log "arm-fire: stale token, ignoring"; do_status; return 0; }
   preview_flag=$(jq -r '.preview // false' "$PENDING_FILE" 2>/dev/null || echo false)
   auto_flag=$(jq -r '.autoTriggered // false' "$PENDING_FILE" 2>/dev/null || echo false)
   [[ $preview_flag == true ]] && trigger=preview || { [[ $auto_flag == true ]] && trigger=auto; }
   rm -f "$NOTIFY_ID_FILE"
   pending_clear
   log "arm fired (preview=$preview_flag trigger=$trigger)"
-  do_on "$preview_flag" "$trigger"
+  do_on_locked "$preview_flag" "$trigger"
 }
 
 # --------------------------------------------------------------------- on ----
 
 do_on() {
+  acquire_lock
+  do_on_locked "$@"
+}
+
+# Caller MUST hold the action lock. arm-fire/enter-now/arm-disabled call this
+# directly so token validation, pending consumption and entry are one critical
+# section (no window where a concurrent disarm is ignored).
+do_on_locked() {
   local preview_flag="${1:-false}" trigger="${2:-}"
   [[ -n $trigger ]] || { [[ $preview_flag == true ]] && trigger=preview || trigger=manual; }
-  acquire_lock
 
   # A direct on (shortcut, CLI, arm worker) supersedes any pending countdown.
   if is_pending; then
@@ -1091,72 +1191,113 @@ do_on() {
     return 0
   fi
 
-  local now pre_stay=false old_profile="" sink="" old_muted=false old_brightness="" snapshot
+  local now pre_stay=false old_profile="" sink="" old_muted=false old_suspended=false old_brightness="" snapshot prior_retry_count=0
   now=$(date -Is)
+  prior_retry_count=$(state_get retryCount 0); [[ $prior_retry_count =~ ^[0-9]+$ ]] || prior_retry_count=0
 
   # --- snapshot everything we are about to change ---
   [[ -f $STAY_AWAKE_FILE ]] && pre_stay=true
   old_profile=$(powerprofilesctl get 2>/dev/null || echo "")
   sink=$(omarchy-audio-output-sink 2>/dev/null || echo "")
-  if [[ -n $sink ]] && [[ $(pactl get-sink-mute "$sink" 2>/dev/null) == *yes* ]]; then
-    old_muted=true
+  if [[ -n $sink ]]; then
+    [[ $(pactl get-sink-mute "$sink" 2>/dev/null) == *yes* ]] && old_muted=true
+    [[ $(pactl get-sink-volume "$sink" 2>/dev/null) == *"SUSPENDED"* ]] && old_suspended=true
   fi
   if [[ $(cfg '.screen.dimPercent' 0) != 0 ]]; then
     old_brightness=$(omarchy-brightness-display --no-osd 2>/dev/null || echo "")
   fi
 
+  # applied.* flags record what ACTUALLY succeeded, so restore only undoes real
+  # changes and keeps evidence for anything that fails.
   snapshot=$(jq -n \
       --argjson stayAwakePreexisting "$pre_stay" \
       --arg powerProfile "$old_profile" \
       --arg sink "$sink" \
       --argjson sinkMuted "$old_muted" \
+      --argjson sinkSuspended "$old_suspended" \
       --arg brightness "$old_brightness" \
       '{stayAwakePreexisting:$stayAwakePreexisting, powerProfile:$powerProfile,
-        sink:$sink, sinkMuted:$sinkMuted, brightness:$brightness}')
+        sink:$sink, sinkMuted:$sinkMuted, sinkSuspended:$sinkSuspended,
+        brightness:$brightness,
+        applied:{inhibit:false, idle:false, power:false, mute:false, suspend:false,
+                 freeze:false, keyboard:false, dim:false, dpms:false}}')
 
   write_state true "$now" "$snapshot" "applying"
   patch_state_str trigger "$trigger"
   patch_state monitorIds "$(monitor_ids)"
 
   # 1. Block suspend (including lid close) — the core "agents stay online" bit.
-  start_inhibit
+  if [[ $(cfg '.inhibit.enabled' true) == true ]]; then
+    if start_inhibit; then patch_snapshot 'applied.inhibit' true; fi
+  fi
 
   # 2. Reuse Omarchy's own Stay Awake switch so the 150s screensaver and 300s
   #    idle lock never interrupt the session. The idle service hot-reloads it.
   if [[ $(cfg '.idle.linkStayAwake' true) == true && $pre_stay == false ]]; then
-    omarchy-toggle-idle stay-awake >/dev/null 2>&1 || {
-      mkdir -p "$(dirname "$STAY_AWAKE_FILE")" 2>/dev/null
-      : >"$STAY_AWAKE_FILE"
-    }
-    log "linked Stay Awake on"
+    if omarchy-toggle-idle stay-awake >/dev/null 2>&1 || {
+         mkdir -p "$(dirname "$STAY_AWAKE_FILE")" 2>/dev/null && : >"$STAY_AWAKE_FILE"; }; then
+      patch_snapshot 'applied.idle' true
+      log "linked Stay Awake on"
+    else
+      log "WARNING could not link Stay Awake"
+    fi
   fi
 
   # 3. Lower the power profile (balanced by default: agents stay responsive).
   if [[ $(cfg '.powerProfile.enabled' true) == true ]]; then
     local profile; profile=$(cfg '.powerProfile.profile' 'balanced')
-    powerprofilesctl set "$profile" >/dev/null 2>&1 && log "power profile -> $profile" \
-      || log "power profile change failed"
+    if powerprofilesctl set "$profile" >/dev/null 2>&1; then
+      patch_snapshot 'applied.power' true
+      log "power profile -> $profile"
+    else
+      log "power profile change failed"
+    fi
   fi
 
   # 4. Silence audio (off by default — HW_MUTE_CTRL causes pops on this machine).
   if [[ -n $sink ]]; then
-    [[ $(cfg '.audio.mute' false) == true ]] && pactl set-sink-mute "$sink" 1 >/dev/null 2>&1 || true
-    [[ $(cfg '.audio.suspendSinks' false) == true ]] && pactl suspend-sink "$sink" 1 >/dev/null 2>&1 || true
+    if [[ $(cfg '.audio.mute' false) == true ]]; then
+      if pactl set-sink-mute "$sink" 1 >/dev/null 2>&1; then
+        patch_snapshot 'applied.mute' true
+      else
+        log "WARNING sink mute failed"
+      fi
+    fi
+    if [[ $(cfg '.audio.suspendSinks' false) == true ]]; then
+      if pactl suspend-sink "$sink" 1 >/dev/null 2>&1; then
+        patch_snapshot 'applied.suspend' true
+      else
+        log "WARNING sink suspend failed"
+      fi
+    fi
   fi
 
   # 5. Optionally freeze non-essential processes (agents are allow-listed out).
-  freeze_processes
+  if [[ $(cfg '.freeze.enabled' false) == true ]]; then
+    freeze_processes
+    [[ -r $FROZEN_FILE ]] && patch_snapshot 'applied.freeze' true
+  fi
 
   # 6. Keyboard backlight off; optional backlight dim.
-  [[ $(cfg '.screen.keyboardBacklightOff' true) == true ]] && omarchy-brightness-keyboard off >/dev/null 2>&1 || true
+  if [[ $(cfg '.screen.keyboardBacklightOff' true) == true ]]; then
+    if omarchy-brightness-keyboard off >/dev/null 2>&1; then
+      patch_snapshot 'applied.keyboard' true
+    else
+      log "WARNING keyboard backlight off failed"
+    fi
+  fi
   local dim; dim=$(cfg '.screen.dimPercent' 0)
   if [[ $dim != 0 && -n $old_brightness ]]; then
-    omarchy-brightness-display --no-osd "${dim}%" >/dev/null 2>&1 || true
+    if omarchy-brightness-display --no-osd "${dim}%" >/dev/null 2>&1; then
+      patch_snapshot 'applied.dim' true
+    else
+      log "WARNING display dim failed"
+    fi
   fi
 
   # 7. Lock first, then blank the outputs. A lock failure must never leave a
-  #    half-enabled state: undo everything in place (do_off would deadlock on
-  #    our own flock) and schedule a bounded retry for the bar widget.
+  #    half-enabled state: undo everything via the shared snapshot-driven
+  #    restore helper and schedule a bounded retry for the bar widget.
   local lock_failed=false
   if [[ $(cfg '.screen.lock' true) == true ]]; then
     if ! omarchy-system-lock >/dev/null 2>&1; then
@@ -1167,21 +1308,21 @@ do_on() {
   fi
   if [[ $lock_failed == true ]]; then
     log "rolling back to off after lock failure"
-    stop_inhibit
-    unfreeze_processes
-    if [[ $(cfg '.idle.linkStayAwake' true) == true && $pre_stay == false ]]; then
-      omarchy-toggle-idle allow-idle >/dev/null 2>&1 || true
+    # Capture retry metadata BEFORE any state rewrite destroys it (do_on_locked
+    # already read it before writing the fresh entry state).
+    local count retry_sec
+    count=$prior_retry_count
+    retry_sec=$(cfg '.enter.retrySec' 60); [[ $retry_sec =~ ^[0-9]+$ ]] || retry_sec=60
+    if ! restore_applied; then
+      # Incomplete rollback: keep enabled/restoring + snapshot so a later off
+      # can finish recovery. Do NOT schedule another entry attempt.
+      patch_state_str phase restoring
+      log "rollback incomplete; keeping recovery state, no retry scheduled"
+      do_status
+      return 1
     fi
-    if [[ -n $old_profile && $(cfg '.powerProfile.enabled' true) == true ]]; then
-      powerprofilesctl set "$old_profile" >/dev/null 2>&1 || true
-    fi
-    [[ $(cfg '.screen.keyboardBacklightOff' true) == true ]] && \
-      omarchy-brightness-keyboard restore >/dev/null 2>&1 || true
     write_state false "" '{}' "off"
     patch_state lastOffAt "$(date +%s)"
-    local count retry_sec
-    count=$(state_get retryCount 0); [[ $count =~ ^[0-9]+$ ]] || count=0
-    retry_sec=$(cfg '.enter.retrySec' 60); [[ $retry_sec =~ ^[0-9]+$ ]] || retry_sec=60
     if (( count < 3 )); then
       patch_state healthLockFailed true
       patch_state retryAt $(( $(date +%s) + retry_sec ))
@@ -1198,8 +1339,12 @@ do_on() {
   # timer). Never re-issue DPMS off here or from reconcile: that fights its
   # WAKE/BLANK state machine and breaks face unlock.
   if [[ $(cfg '.screen.dpmsOff' true) == true ]]; then
-    omarchy-brightness-display off >/dev/null 2>&1 || \
-      hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1 || true
+    if omarchy-brightness-display off >/dev/null 2>&1 || \
+       hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1; then
+      patch_snapshot 'applied.dpms' true
+    else
+      log "WARNING DPMS off failed"
+    fi
   fi
 
   patch_state_str phase active
@@ -1223,6 +1368,99 @@ do_on() {
 
 # -------------------------------------------------------------------- off ----
 
+# Shared, snapshot-driven restoration used by BOTH normal off and lock-failure
+# rollback. Only undoes actions recorded as actually applied; aggregates every
+# failure and returns nonzero without clearing recovery evidence for the parts
+# that could not be restored. Caller holds the action lock.
+restore_applied() {
+  local failed=false sink old_muted old_suspended old_profile old_brightness pre_stay
+
+  sink=$(snap_get sink "")
+  old_muted=$(snap_get sinkMuted false)
+  old_suspended=$(snap_get sinkSuspended false)
+  old_profile=$(snap_get powerProfile "")
+  old_brightness=$(snap_get brightness "")
+  pre_stay=$(snap_get stayAwakePreexisting false)
+
+  # 1. Bring the display back first so the restore is visible.
+  if [[ $(snap_get 'applied.dpms' false) == true ]]; then
+    if omarchy-brightness-display on >/dev/null 2>&1; then
+      patch_snapshot 'applied.dpms' false
+    else
+      log "WARNING DPMS restore failed"; failed=true
+    fi
+  fi
+  if [[ $(snap_get 'applied.keyboard' false) == true ]]; then
+    if omarchy-brightness-keyboard restore >/dev/null 2>&1; then
+      patch_snapshot 'applied.keyboard' false
+    else
+      log "WARNING keyboard backlight restore failed"; failed=true
+    fi
+  fi
+  if [[ $(snap_get 'applied.dim' false) == true && -n $old_brightness ]]; then
+    if omarchy-brightness-display --no-osd "${old_brightness}%" >/dev/null 2>&1; then
+      patch_snapshot 'applied.dim' false
+    else
+      log "WARNING brightness restore failed"; failed=true
+    fi
+  fi
+
+  # 2. Restore audio to the exact pre-entry state (including prior suspension).
+  if [[ -n $sink && $(snap_get 'applied.suspend' false) == true ]]; then
+    local target=0; [[ $old_suspended == true ]] && target=1
+    if pactl suspend-sink "$sink" "$target" >/dev/null 2>&1; then
+      patch_snapshot 'applied.suspend' false
+    else
+      log "WARNING sink suspend restore failed"; failed=true
+    fi
+  fi
+  if [[ -n $sink && $(snap_get 'applied.mute' false) == true ]]; then
+    local target=0; [[ $old_muted == true ]] && target=1
+    if pactl set-sink-mute "$sink" "$target" >/dev/null 2>&1; then
+      patch_snapshot 'applied.mute' false
+    else
+      log "WARNING sink mute restore failed"; failed=true
+    fi
+  fi
+
+  # 3. Restore the power profile we found on the way in.
+  if [[ $(snap_get 'applied.power' false) == true && -n $old_profile ]]; then
+    if powerprofilesctl set "$old_profile" >/dev/null 2>&1; then
+      patch_snapshot 'applied.power' false
+    else
+      log "WARNING power profile restore failed"; failed=true
+    fi
+  fi
+
+  # 4. Unfreeze, release the suspend block, restore Stay Awake.
+  if [[ $(snap_get 'applied.freeze' false) == true ]]; then
+    if unfreeze_processes; then
+      patch_snapshot 'applied.freeze' false
+    else
+      log "WARNING unfreeze incomplete"; failed=true
+    fi
+  fi
+  if [[ $(snap_get 'applied.inhibit' false) == true ]]; then
+    if stop_inhibit; then
+      patch_snapshot 'applied.inhibit' false
+    else
+      log "WARNING inhibitor release incomplete"; failed=true
+    fi
+  fi
+  if [[ $(snap_get 'applied.idle' false) == true && $pre_stay == false ]]; then
+    # Only treat the marker as gone when it is actually absent; a failed toggle
+    # plus a failed rm must keep the evidence and report failure.
+    if omarchy-toggle-idle allow-idle >/dev/null 2>&1 || { rm -f "$STAY_AWAKE_FILE" && [[ ! -e $STAY_AWAKE_FILE ]]; }; then
+      patch_snapshot 'applied.idle' false
+      log "restored Stay Awake off"
+    else
+      log "WARNING Stay Awake restore failed"; failed=true
+    fi
+  fi
+
+  [[ $failed == false ]]
+}
+
 do_off() {
   acquire_lock
 
@@ -1232,47 +1470,17 @@ do_off() {
   fi
 
   patch_state_str phase restoring
-  local snap pre_stay old_profile sink old_muted old_brightness
-  # Capture the watch identity BEFORE write_state clears it. Passing these in
-  # keeps history recording independent of the state file's later contents.
+  # Capture the watch identity BEFORE any state rewrite clears it. Passing
+  # these in keeps history recording independent of later state contents.
   local watch_since watch_trigger
   watch_since=$(state_get since "")
   watch_trigger=$(state_get trigger manual)
-  snap=$(jq -c '.snapshot // {}' "$STATE_FILE" 2>/dev/null || echo '{}')
-  pre_stay=$(jq -r '.stayAwakePreexisting // false' <<<"$snap")
-  old_profile=$(jq -r '.powerProfile // ""' <<<"$snap")
-  sink=$(jq -r '.sink // ""' <<<"$snap")
-  old_muted=$(jq -r '.sinkMuted // false' <<<"$snap")
-  old_brightness=$(jq -r '.brightness // ""' <<<"$snap")
 
-  # 1. Bring the display back first so the restore is visible.
-  [[ $(cfg '.screen.dpmsOff' true) == true ]] && omarchy-brightness-display on >/dev/null 2>&1 || true
-  [[ $(cfg '.screen.keyboardBacklightOff' true) == true ]] && omarchy-brightness-keyboard restore >/dev/null 2>&1 || true
-  if [[ -n $old_brightness ]]; then
-    omarchy-brightness-display --no-osd "${old_brightness}%" >/dev/null 2>&1 || true
-  fi
-
-  # 2. Restore audio.
-  if [[ -n $sink ]]; then
-    [[ $(cfg '.audio.suspendSinks' false) == true ]] && pactl suspend-sink "$sink" 0 >/dev/null 2>&1 || true
-    if [[ $(cfg '.audio.mute' false) == true ]]; then
-      if [[ $old_muted == true ]]; then pactl set-sink-mute "$sink" 1 >/dev/null 2>&1 || true
-      else pactl set-sink-mute "$sink" 0 >/dev/null 2>&1 || true
-      fi
-    fi
-  fi
-
-  # 3. Restore the power profile we found on the way in.
-  if [[ -n $old_profile && $(cfg '.powerProfile.enabled' true) == true ]]; then
-    powerprofilesctl set "$old_profile" >/dev/null 2>&1 || true
-  fi
-
-  # 4. Unfreeze, release the suspend block, restore Stay Awake.
-  unfreeze_processes
-  stop_inhibit
-  if [[ $(cfg '.idle.linkStayAwake' true) == true && $pre_stay == false ]]; then
-    omarchy-toggle-idle allow-idle >/dev/null 2>&1 || rm -f "$STAY_AWAKE_FILE"
-    log "restored Stay Awake off"
+  if ! restore_applied; then
+    # Keep enabled/restoring + snapshot/PID/frozen records so a retry can finish.
+    log "restore incomplete; keeping recovery state (off returned failure)"
+    do_status
+    return 1
   fi
 
   write_state false "" '{}' "off"

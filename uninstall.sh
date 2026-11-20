@@ -14,7 +14,7 @@ PLUGIN_ID="eclipse.agent-ready"
 PURGE=0
 RESTART=1
 
-usage() { sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while (( $# > 0 )); do
   case "$1" in
@@ -27,6 +27,7 @@ done
 
 say()  { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
+die()  { printf 'uninstall.sh: %s\n' "$*" >&2; exit 1; }
 
 BIN="$HOME/.local/bin/omarchy-agent-ready"
 CFG_DIR="$HOME/.config/omarchy/agent-ready"
@@ -46,16 +47,24 @@ if [[ -x "$BIN" ]]; then
   say "Agent Ready is off (any active scene was restored)"
 fi
 
-if [[ -f "$SHELL_JSON" ]] && command -v jq >/dev/null 2>&1; then
-  cp -f "$SHELL_JSON" "$SHELL_JSON.agent-ready.bak"
-  tmp="$SHELL_JSON.tmp"
+# Do not silently leave a stale bar registration behind.
+if [[ -f "$SHELL_JSON" ]] && ! command -v jq >/dev/null 2>&1; then
+  die "jq is required to remove the widget from shell.json; install jq and retry"
+fi
+
+if [[ -f "$SHELL_JSON" ]]; then
+  command -v jq >/dev/null 2>&1 || die "jq is required to update shell.json"
+  stamp="$(date +%Y%m%d%H%M%S).$$"
+  tmp="$(mktemp "$SHELL_JSON.tmp.XXXXXX")"
   jq --arg id "$PLUGIN_ID" '
      .bar.layout |= with_entries(
        if (.value | type) == "array"
        then .value = [.value[] | select((type == "object" and .id == $id) | not)]
        else . end)
-   ' "$SHELL_JSON" > "$tmp" && mv "$tmp" "$SHELL_JSON"
-  say "removed $PLUGIN_ID from shell.json (backup: shell.json.agent-ready.bak)"
+   ' "$SHELL_JSON" > "$tmp" || { rm -f "$tmp"; die "could not rewrite shell.json"; }
+  cp -a "$SHELL_JSON" "$SHELL_JSON.agent-ready.bak.$stamp"
+  mv -f "$tmp" "$SHELL_JSON"
+  say "removed $PLUGIN_ID from shell.json (backup: shell.json.agent-ready.bak.$stamp)"
 fi
 
 rm -f "$BIN"                 && say "removed $BIN"
@@ -69,8 +78,11 @@ else
 fi
 
 if (( RESTART )) && command -v omarchy >/dev/null 2>&1; then
-  omarchy restart shell >/dev/null 2>&1 || warn "could not restart the shell"
-  say "shell restarted"
+  if omarchy restart shell >/dev/null 2>&1; then
+    say "shell restarted"
+  else
+    warn "could not restart the shell; do it manually"
+  fi
 fi
 
 echo "Done."

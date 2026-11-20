@@ -1,24 +1,23 @@
 ---
 title: Agent Ready 开发与发布指南
 type: development
-date: 2026-11-13
-status: release-preparation
-canonical_path: /home/eclipse/omarchy-agent-ready-release/docs/DEVELOPMENT.md
+date: 2026-11-21
+status: release-verified
 ---
 
 # Agent Ready — 开发与发布指南
 
 ## TLDR / 发布现状更正
 
-本文面向维护 CLI、QML 插件与发布流程的开发者：先阅读本节，再按下文原始 19 节理解架构、接口与踩坑记录。发布整理基准为 **1.1.0**，作者为 **menmer0859**，仓库为 https://github.com/menmer0859/omarchy-agent-ready （克隆地址 https://github.com/menmer0859/omarchy-agent-ready.git）；插件 id **保持 `eclipse.agent-ready`**，不随作者名更改。
+本文面向维护 CLI、QML 插件与发布流程的开发者：先阅读本节，再按下文原始 19 节理解架构、接口与踩坑记录。发布整理基准为 **1.1.0**，作者为 **Haomeng Kang（GitHub：`menmer0859`）**，仓库为 https://github.com/menmer0859/omarchy-agent-ready （克隆地址 https://github.com/menmer0859/omarchy-agent-ready.git）；插件 id **保持 `eclipse.agent-ready`**，不随作者名更改。
 
-**发布默认 `agents.allow` 改为 `[]`**，不是历史作者机器的 13 名清单。空列表只表示没有配置自动检测的进程名字，不会禁用 inhibitor、锁屏、DPMS 或其它电源行为；用户必须根据自己的机器配置实际进程名。检测按进程名精确匹配、统计名字种类而非 PID 数；由 node/python 启动且进程名仍是解释器的 Agent 无法识别，可由 hook 通过 `digest set` 提供精确 `agents` 数组。不要为了计数把所有 node/python 进程当成 Agent。**空名单也意味着没有 Agent 的 freeze 白名单保护**。实验性 freeze 默认关闭；启用前必须先配置自己的白名单并核查冻结规则。`set` 只解析 bool/int/string，不支持 JSON 数组，不能用它设置 `agents.allow`；请编辑配置或使用 `/home/eclipse/omarchy-agent-ready-release/docs/CLI.md` 中的 jq 临时文件更新示例。
+**发布默认 `agents.allow` 改为 `[]`**，不是历史作者机器的 13 名清单。空列表只表示没有配置自动检测的进程名字，不会禁用 inhibitor、锁屏、DPMS 或其它电源行为；用户必须根据自己的机器配置实际进程名。检测按进程名精确匹配、统计名字种类而非 PID 数；由 node/python 启动且进程名仍是解释器的 Agent 无法识别，可由 hook 通过 `digest set` 提供精确 `agents` 数组。不要为了计数把所有 node/python 进程当成 Agent。**空名单也意味着没有 Agent 的 freeze 白名单保护**。实验性 freeze 默认关闭；启用前必须先配置自己的白名单并核查冻结规则。`set` 只解析 bool/int/string，不支持 JSON 数组，不能用它设置 `agents.allow`；请编辑配置或使用 `docs/CLI.md` 中的 jq 临时文件更新示例。
 
 ## 事实与证据 / 阅读约定
 
-- **发布整理基准**：上述作者、URL、版本与空白名单是本次发布要求；对应核对入口为 `/home/eclipse/omarchy-agent-ready-release/manifest.json`、`/home/eclipse/omarchy-agent-ready-release/LICENSE`、`/home/eclipse/omarchy-agent-ready-release/config/config.json` 及 `/home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready`。本次仅整理文档，不据此宣称已完成跨机器或真实电源验收。
-- **历史已记录事实**：以下 19 节完整迁移自原 `/home/eclipse/omarchy-agent-ready-release/HANDOFF.md`，保留原始验收结论、待办、行数和作者机器经验；它们是历史快照，不是重新验证的发布现状。原开头“已人工验收”与第 19 节“最近一轮待人工验收”均保留，须按各自记录范围理解。
-- **路径约定**：仓库内参考基准为绝对路径 `/home/eclipse/omarchy-agent-ready-release`。用户安装路径使用 `$HOME/...`，其中 `$HOME` 是安装者自己的绝对 home（不是固定 `/home/eclipse`）；文中的命令在 shell 内展开它。第 19 节专列的 `/home/eclipse/...` 是作者机器历史开发位置，不应复制为其他用户的安装位置。
+- **发布整理基准**：上述作者、URL、版本与空白名单是本次发布要求；对应核对入口为 `manifest.json`、`LICENSE`、`config/config.json` 及 `bin/omarchy-agent-ready`。本次仅整理文档，不据此宣称已完成跨机器或真实电源验收。
+- **历史已记录事实**：以下 19 节完整迁移自原 `HANDOFF.md`，保留原始验收结论、待办、行数和作者机器经验；它们是历史快照，不是重新验证的发布现状。原开头“已人工验收”与第 19 节“最近一轮待人工验收”均保留，须按各自记录范围理解。
+- **路径约定**：仓库内参考基准为仓库根目录；用户安装路径使用 `$HOME/...`，其中 `$HOME` 是安装者自己的绝对 home。文中的命令在 shell 内展开它。第 19 节专列的 `$HOME/...` 是作者机器历史开发位置，不应复制为其他用户的安装位置。
 - **当前风险 / 待验证**：截图、Omarchy 兼容范围、机器电源与音频行为及最近一轮人工验收仍需按第 12、16、19 节核对；历史“无已知阻断性缺陷”不是发布质量保证。第 18 节未实现功能与重启状态对账限制仍作为开放问题保留。
 
 ## 步骤 / 开发者入口
@@ -29,10 +28,15 @@ canonical_path: /home/eclipse/omarchy-agent-ready-release/docs/DEVELOPMENT.md
 
 ## 路径索引
 
-- CLI 与配置说明：`/home/eclipse/omarchy-agent-ready-release/docs/CLI.md`。
-- 插件内部说明：`/home/eclipse/omarchy-agent-ready-release/docs/PLUGIN.md`。
-- 用户入口：`/home/eclipse/omarchy-agent-ready-release/README.md`。
-- 原交接文档已迁移至本文；原入口 `/home/eclipse/omarchy-agent-ready-release/HANDOFF.md` 删除，不再作为维护入口。
+- CLI 与配置说明：`docs/CLI.md`。
+- 插件内部说明：`docs/PLUGIN.md`。
+- 用户入口：`README.md`。
+- 原交接文档已迁移至本文；原入口 `HANDOFF.md` 删除，不再作为维护入口。
+
+## 2026-11-21 修复记录
+
+- **第 1 轮（代码/状态机/恢复）**：完成空名单语义、自动布防取消、空白卡片、锁失败回滚与有限重试、arm-fire 取消竞态、恢复失败证据保留、auto-arm 去重、inhibit disabled 状态修复；`release-smoke` 和 `transition-smoke` 均全绿。
+- **第 2 轮（投稿/交付卫生）**：文档改为仓库相对路径，重建 `RELEASE-VERIFICATION.md`，补齐 marketplace manual-setup 说明，恢复中文 README，增加根目录 `preview.png`，并将安装/卸载器改为事务式流程；两套 smoke 仍全绿。
 
 ---
 
@@ -43,12 +47,12 @@ canonical_path: /home/eclipse/omarchy-agent-ready-release/docs/DEVELOPMENT.md
 > **给接手本文的 Agent**
 > 你的任务：把这个项目整理成 GitHub 仓库并发布，让任何 Omarchy 用户能装得上、用得了。
 > 本文是唯一需要读的文档：**设计、架构、全部代码、踩过的坑、发布步骤、待办**都在这里。
-> 所有源码已经放在原交接文档所在的目录（`/home/eclipse/omarchy-agent-ready-release`），按可直接 `git init` 的结构组织好。
+> 所有源码已经放在原交接文档所在的目录（`.`），按可直接 `git init` 的结构组织好。
 > 当前项目状态：**功能完整、已通过本机人工验收、无已知阻断性缺陷**。
 >
 > **30 秒摘要**
-> 1. 本目录就是仓库根，`/home/eclipse/omarchy-agent-ready-release/README.md` 面向最终用户，`/home/eclipse/omarchy-agent-ready-release/docs` 是完整技术文档，本文面向你。
-> 2. `/home/eclipse/omarchy-agent-ready-release/install.sh` / `/home/eclipse/omarchy-agent-ready-release/uninstall.sh` 已写好并在隔离 HOME 里跑通（幂等、不覆盖用户配置）。
+> 1. 本目录就是仓库根，`README.md` 面向最终用户，`docs` 是完整技术文档，本文面向你。
+> 2. `install.sh` / `uninstall.sh` 已写好并在隔离 HOME 里跑通（幂等、不覆盖用户配置）。
 > 3. 发布前**必须**处理第 12 节「发布前清单」里的 6 项（作者信息、仓库 URL、agent 白名单、截图等）。
 > 4. 不要改第 10 节列出的硬编码标识，除非同步改所有引用点。
 > 5. 全程**不要**修改 `/usr/share/omarchy` 下的任何系统文件——这是项目的核心设计约束。
@@ -147,7 +151,7 @@ Omarchy 桌面用户，尤其是跑后台编码 Agent / 长时间任务、希望
 │  • PluginI18n（可写 language）驱动全部 UI 文案                        │
 └───────────────────────────────────────────────────────────────────────┘
 
-共享资源：/home/eclipse/omarchy-agent-ready-release/i18n/{en,zh-CN}.json —— CLI 通知与 QML UI 的单一文案源
+共享资源：i18n/{en,zh-CN}.json —— CLI 通知与 QML UI 的单一文案源
 ```
 
 ### 三条设计原则
@@ -180,37 +184,37 @@ Omarchy 桌面用户，尤其是跑后台编码 Agent / 长时间任务、希望
 
 ## 3. 完整文件清单
 
-仓库根（不是本文所在的 docs 目录）= `/home/eclipse/omarchy-agent-ready-release`。**根目录同时就是 Omarchy 插件目录**
-（`/home/eclipse/omarchy-agent-ready-release/manifest.json` + `/home/eclipse/omarchy-agent-ready-release/Widget.qml` + `/home/eclipse/omarchy-agent-ready-release/PluginI18n.qml` + `/home/eclipse/omarchy-agent-ready-release/i18n` 在根，这样
+仓库根（不是本文所在的 docs 目录）= `.`。**根目录同时就是 Omarchy 插件目录**
+（`manifest.json` + `Widget.qml` + `PluginI18n.qml` + `i18n` 在根，这样
 `omarchy plugin add <url>` 能直接把整个仓库当插件装）。
 
 | 仓库内路径 | 行数 | 职责 | 安装到 |
 |---|---:|---|---|
-| `/home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready` | 1399 | **核心 CLI**（bash）：状态机、电源动作、通知、digest/history、语言解析、doctor | `$HOME/.local/bin/omarchy-agent-ready` (0755) |
-| `/home/eclipse/omarchy-agent-ready-release/Widget.qml` | 1152 | **bar-widget 插件**：三张 face、倒计时、IdleMonitor、reconcile、命令队列、ShellIpc | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/Widget.qml` |
-| `/home/eclipse/omarchy-agent-ready-release/PluginI18n.qml` | 81 | 可写 `language` 的 `Commons.Translations` 孪生组件 | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/PluginI18n.qml` |
-| `/home/eclipse/omarchy-agent-ready-release/manifest.json` | 36 | Omarchy 插件清单（`schemaVersion:1`, `kinds:["bar-widget"]`, id, 版本, `panelWidth` schema） | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/manifest.json` |
-| `/home/eclipse/omarchy-agent-ready-release/i18n/en.json` | 133 | 英文 catalog（127 keys：UI + 通知 + 摘要 + 语言） | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/i18n/en.json` |
-| `/home/eclipse/omarchy-agent-ready-release/i18n/zh-CN.json` | 133 | 简体中文 catalog（与 en 严格同 key） | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/i18n/zh-CN.json` |
-| `/home/eclipse/omarchy-agent-ready-release/config/config.json` | 46 | **默认配置模板**（`language:auto`, `digest.enabled:true`, `labels:{}`） | `$HOME/.config/omarchy/agent-ready/config.json`（仅首次） |
-| `/home/eclipse/omarchy-agent-ready-release/config/enter.d/README.md` | 19 | hook 约定说明 | `$HOME/.config/omarchy/agent-ready/enter.d/README.md` |
-| `/home/eclipse/omarchy-agent-ready-release/config/enter.d/example-digest.sh.disabled` | 23 | 示例：进入时写 digest（默认禁用） | `$HOME/.config/omarchy/agent-ready/enter.d/example-digest.sh.disabled` |
-| `/home/eclipse/omarchy-agent-ready-release/config/leave.d/README.md` | 19 | hook 约定说明 | `$HOME/.config/omarchy/agent-ready/leave.d/README.md` |
-| `/home/eclipse/omarchy-agent-ready-release/config/leave.d/example-bark.sh.disabled` | 23 | 示例：离开时推 Bark（默认禁用） | `$HOME/.config/omarchy/agent-ready/leave.d/example-bark.sh.disabled` |
-| `/home/eclipse/omarchy-agent-ready-release/docs/CLI.md` | 409 | **完整 CLI/配置文档**（原 `$HOME/.config/omarchy/agent-ready/README.md`，仅修正了仓库内交叉引用） | 文档，不安装 |
-| `/home/eclipse/omarchy-agent-ready-release/docs/PLUGIN.md` | 209 | **完整 widget 内部文档**（原插件 README，仅修正了仓库内交叉引用） | 文档，不安装 |
-| `/home/eclipse/omarchy-agent-ready-release/README.md` | 138 | 面向最终用户：功能、要求、安装、用法、配置摘要、卸载、限制 | 文档 |
-| `/home/eclipse/omarchy-agent-ready-release/docs/DEVELOPMENT.md` | 本文 | 开发指南（由原 HANDOFF.md 迁移） | 文档 |
-| `/home/eclipse/omarchy-agent-ready-release/install.sh` | ~145 | 一键安装（幂等、备份 shell.json、doctor、重启） | 文档/工具 |
-| `/home/eclipse/omarchy-agent-ready-release/uninstall.sh` | ~75 | 卸载（默认保留 config/history，`--purge` 全删） | 文档/工具 |
-| `/home/eclipse/omarchy-agent-ready-release/LICENSE` | 21 | MIT | 文档 |
-| `/home/eclipse/omarchy-agent-ready-release/.gitignore` | 9 | 排除运行时 state/log/bak | 文档 |
+| `bin/omarchy-agent-ready` | 1399 | **核心 CLI**（bash）：状态机、电源动作、通知、digest/history、语言解析、doctor | `$HOME/.local/bin/omarchy-agent-ready` (0755) |
+| `Widget.qml` | 1152 | **bar-widget 插件**：三张 face、倒计时、IdleMonitor、reconcile、命令队列、ShellIpc | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/Widget.qml` |
+| `PluginI18n.qml` | 81 | 可写 `language` 的 `Commons.Translations` 孪生组件 | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/PluginI18n.qml` |
+| `manifest.json` | 36 | Omarchy 插件清单（`schemaVersion:1`, `kinds:["bar-widget"]`, id, 版本, `panelWidth` schema） | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/manifest.json` |
+| `i18n/en.json` | 133 | 英文 catalog（127 keys：UI + 通知 + 摘要 + 语言） | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/i18n/en.json` |
+| `i18n/zh-CN.json` | 133 | 简体中文 catalog（与 en 严格同 key） | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/i18n/zh-CN.json` |
+| `config/config.json` | 46 | **默认配置模板**（`language:auto`, `digest.enabled:true`, `labels:{}`） | `$HOME/.config/omarchy/agent-ready/config.json`（仅首次） |
+| `config/enter.d/README.md` | 19 | hook 约定说明 | `$HOME/.config/omarchy/agent-ready/enter.d/README.md` |
+| `config/enter.d/example-digest.sh.disabled` | 23 | 示例：进入时写 digest（默认禁用） | `$HOME/.config/omarchy/agent-ready/enter.d/example-digest.sh.disabled` |
+| `config/leave.d/README.md` | 19 | hook 约定说明 | `$HOME/.config/omarchy/agent-ready/leave.d/README.md` |
+| `config/leave.d/example-bark.sh.disabled` | 23 | 示例：离开时推 Bark（默认禁用） | `$HOME/.config/omarchy/agent-ready/leave.d/example-bark.sh.disabled` |
+| `docs/CLI.md` | 409 | **完整 CLI/配置文档**（原 `$HOME/.config/omarchy/agent-ready/README.md`，仅修正了仓库内交叉引用） | 文档，不安装 |
+| `docs/PLUGIN.md` | 209 | **完整 widget 内部文档**（原插件 README，仅修正了仓库内交叉引用） | 文档，不安装 |
+| `README.md` | 138 | 面向最终用户：功能、要求、安装、用法、配置摘要、卸载、限制 | 文档 |
+| `docs/DEVELOPMENT.md` | 本文 | 开发指南（由原 HANDOFF.md 迁移） | 文档 |
+| `install.sh` | ~145 | 一键安装（幂等、备份 shell.json、doctor、重启） | 文档/工具 |
+| `uninstall.sh` | ~75 | 卸载（默认保留 config/history，`--purge` 全删） | 文档/工具 |
+| `LICENSE` | 21 | MIT | 文档 |
+| `.gitignore` | 9 | 排除运行时 state/log/bak | 文档 |
 
 **不发布（运行时生成，在 `$HOME/.local/state/omarchy/agent-ready/`）**：
 `$HOME/.local/state/omarchy/agent-ready/state.json`, `$HOME/.local/state/omarchy/agent-ready/pending.json`, `$HOME/.local/state/omarchy/agent-ready/notify.id`, `$HOME/.local/state/omarchy/agent-ready/digest.json`, `$HOME/.local/state/omarchy/agent-ready/history.json`, `$HOME/.local/state/omarchy/agent-ready/inhibit.pid`,
 `$HOME/.local/state/omarchy/agent-ready/frozen.pids`, `$HOME/.local/state/omarchy/agent-ready/lock`, `$HOME/.local/state/omarchy/agent-ready/log`。安装脚本会 `mkdir -p` 这个目录，但**不写任何初始数据**。
 
-> 备注：`/home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready` 顶部定义了 `AUTO_STATE_FILE="$STATE_DIR/auto.json"`，
+> 备注：`bin/omarchy-agent-ready` 顶部定义了 `AUTO_STATE_FILE="$STATE_DIR/auto.json"`，
 > 但全文没有使用，是早期设计残留的**死常量**；可安全删除（见 [12 节](#12-发布前清单) 可选项）。
 
 ---
@@ -273,7 +277,7 @@ off → arming → applying → active → restoring → off
 > **发布更正**：下表为历史配置快照；`agents.allow` 发布默认是 `[]`，旧 13 名只保留作作者机器历史记录。电源行为不依赖检测名字数量，用户须按机器配置。
 
 `$HOME/.config/omarchy/agent-ready/config.json`，面板写入即生效（多数下次进入时生效，
-`language` 与 `digest.enabled` 即时生效）。完整说明见 `/home/eclipse/omarchy-agent-ready-release/docs/CLI.md` 的 Configuration 段。
+`language` 与 `digest.enabled` 即时生效）。完整说明见 `docs/CLI.md` 的 Configuration 段。
 
 | Key | 默认 | 含义 |
 |---|---|---|
@@ -365,7 +369,7 @@ _arm-worker / _arm-fire   内部（旧 worker 兼容 / 倒计时 fire）
 
 ## 7. status-json 契约
 
-Widget 完全依赖这个 JSON；**任何字段改名都要同步改 `/home/eclipse/omarchy-agent-ready-release/Widget.qml` 的 `applyState()`**。
+Widget 完全依赖这个 JSON；**任何字段改名都要同步改 `Widget.qml` 的 `applyState()`**。
 
 ```
 enabled, pending, remainingSec, delaySec, uptimeMin, inhibitAlive,
@@ -394,7 +398,7 @@ config:   { …整个 $HOME/.config/omarchy/agent-ready/config.json… }
 
 | 对象 | 作用 |
 |---|---|
-| `PluginI18n { id: strings }` | 可写 `language: root.language`，加载 `/home/eclipse/omarchy-agent-ready-release/i18n/*.json` |
+| `PluginI18n { id: strings }` | 可写 `language: root.language`，加载 `i18n/*.json` |
 | `Process { id: commandProc }` | 串行 argv-vector 命令队列（`runCommand` / `drainQueue`） |
 | `Process { id: stateProc }` | 跑 `status-json`，`StdioCollector.waitForEnd` → `applyState()` |
 | `Timer`（轮询） | active 500 ms / arming·面板·digest 1 s / 空闲 5 s |
@@ -451,7 +455,7 @@ arming 用 `armingCard.implicitHeight`；digest 用
 
 ### 单一文案源
 
-`/home/eclipse/omarchy-agent-ready-release/i18n/en.json`（base）+ `/home/eclipse/omarchy-agent-ready-release/i18n/<lang>.json`（overlay）。127 个 key，两份严格同 key。
+`i18n/en.json`（base）+ `i18n/<lang>.json`（overlay）。127 个 key，两份严格同 key。
 key 分组：`tooltip.*`, `hero.*`, `button.*`, `section.*`, `field.*`, `toggle.*`,
 `profile.*`, `auto.*`, `arming.*`, `digest.*`, `health.*`, `summary.*`,
 `lang.*`, `notify.*`, `status.*`。
@@ -473,7 +477,7 @@ OMARCHY_LANGUAGE_FILE（测试钉死，最高）
 （**不在 QML 里重复解析规则**），所以 UI 与通知永远一致，切换约 0.6–1 s 生效、无需重启。
 `status-json.languageMode` 报告用户的 `auto/en/zh-CN` 选择。
 
-### 为什么自己写 `/home/eclipse/omarchy-agent-ready-release/PluginI18n.qml`
+### 为什么自己写 `PluginI18n.qml`
 
 系统的 `/usr/share/omarchy/shell/Commons/Translations.qml` 里
 `readonly property string language: I18n.language` 是只读且**绑死系统全局语言**，
@@ -483,8 +487,8 @@ OMARCHY_LANGUAGE_FILE（测试钉死，最高）
 
 ### 加一种语言
 
-1. 复制 `/home/eclipse/omarchy-agent-ready-release/i18n/en.json` → `/home/eclipse/omarchy-agent-ready-release/i18n/<code>.json`，翻译值（保持 `%1` 完整）。
-2. 在 `/home/eclipse/omarchy-agent-ready-release/Widget.qml` **Advanced 底部**的 `languageRow` 加一个 Button，`cellWidth` 除以 3 → 4。
+1. 复制 `i18n/en.json` → `i18n/<code>.json`，翻译值（保持 `%1` 完整）。
+2. 在 `Widget.qml` **Advanced 底部**的 `languageRow` 加一个 Button，`cellWidth` 除以 3 → 4。
 3. 语言名用**母语自称**（`English` / `简体中文` 两种 catalog 里值相同）以便任何 UI 语言下都认得出。
 4. 无需改 CLI：`lang_code()` 自动按 catalog 文件存在性回落。
 
@@ -496,9 +500,9 @@ OMARCHY_LANGUAGE_FILE（测试钉死，最高）
 
 | 标识 | 值 | 出现位置 |
 |---|---|---|
-| 插件 id | `eclipse.agent-ready` | `/home/eclipse/omarchy-agent-ready-release/manifest.json` id；`/home/eclipse/omarchy-agent-ready-release/Widget.qml` `moduleName`、`ShellIpc.target`；`/home/eclipse/omarchy-agent-ready-release/install.sh`/`/home/eclipse/omarchy-agent-ready-release/uninstall.sh` `PLUGIN_ID`；`$HOME/.config/omarchy/shell.json` 的 `{"id":...}`；CLI `I18N_DIR` 路径 |
+| 插件 id | `eclipse.agent-ready` | `manifest.json` id；`Widget.qml` `moduleName`、`ShellIpc.target`；`install.sh`/`uninstall.sh` `PLUGIN_ID`；`$HOME/.config/omarchy/shell.json` 的 `{"id":...}`；CLI `I18N_DIR` 路径 |
 | 插件目录 | `$HOME/.config/omarchy/plugins/eclipse.agent-ready/` | CLI `I18N_DIR`（**硬编码**）、widget `Qt.resolvedUrl("i18n")` 解析基准、两个安装脚本 |
-| CLI 路径 | `$HOME/.local/bin/omarchy-agent-ready` | `/home/eclipse/omarchy-agent-ready-release/Widget.qml` `readonly property string cli`（**硬编码**）；CLI 里 `omarchy-notification-send --action omarchy-agent-ready ...`；hooks 与文档 |
+| CLI 路径 | `$HOME/.local/bin/omarchy-agent-ready` | `Widget.qml` `readonly property string cli`（**硬编码**）；CLI 里 `omarchy-notification-send --action omarchy-agent-ready ...`；hooks 与文档 |
 | config 目录 | `$HOME/.config/omarchy/agent-ready` | CLI `CONFIG_DIR`；安装脚本；hooks 环境变量 |
 | state 目录 | `$HOME/.local/state/omarchy/agent-ready` | CLI `STATE_DIR`；hooks 环境变量 |
 | 系统语言文件 | `$HOME/.config/omarchy/language` | CLI `LANGUAGE_FILE`；Omarchy 全局 |
@@ -592,13 +596,13 @@ CLI 通知最早中英混排写死。现全部进共享 catalog，且支持**插
 
 | # | 项 | 说明 |
 |---|---|---|
-| ★1 | **作者 / 版权** | `/home/eclipse/omarchy-agent-ready-release/LICENSE` 与 `/home/eclipse/omarchy-agent-ready-release/manifest.json` 的 `author` 目前是 `eclipse`；换成真实 GitHub 用户名/组织 |
-| ★2 | **仓库 URL** | `/home/eclipse/omarchy-agent-ready-release/README.md` 与 `/home/eclipse/omarchy-agent-ready-release/install.sh` 注释里的旧占位地址全部替换（现统一为 `https://github.com/menmer0859/omarchy-agent-ready.git`）；`/home/eclipse/omarchy-agent-ready-release/docs/*.md` 里若有也一并替换 |
-| ★3 | **`agents.allow` 本机化** | **历史作者机器清单** 13 个名字（`pi, oh-my-pi, pyagent, py-agent, hermes, opencode, cindy, codex, chatgpt, magpie, claude, grok, omp`）是**作者机器上的 agent 名**。在 README「Configuration」和 `/home/eclipse/omarchy-agent-ready-release/docs/CLI.md` 明确写「按自己机器改」，或改成更中性的默认集 |
+| ★1 | **作者 / 版权** | `LICENSE` 与 `manifest.json` 的 `author` 目前是 `eclipse`；换成真实 GitHub 用户名/组织 |
+| ★2 | **仓库 URL** | `README.md` 与 `install.sh` 注释里的旧占位地址全部替换（现统一为 `https://github.com/menmer0859/omarchy-agent-ready.git`）；`docs/*.md` 里若有也一并替换 |
+| ★3 | **`agents.allow` 本机化** | **历史作者机器清单** 13 个名字（`pi, oh-my-pi, pyagent, py-agent, hermes, opencode, cindy, codex, chatgpt, magpie, claude, grok, omp`）是**作者机器上的 agent 名**。在 README「Configuration」和 `docs/CLI.md` 明确写「按自己机器改」，或改成更中性的默认集 |
 | ★4 | **截图 / 演示** | README 需要至少 1 张状态栏图标 + 1 张设置面板 + 1 张值班摘要截图（本项目目前**没有任何图片资源**）。可标注 "screenshot TBD" 但最好补上 |
-| ★5 | **版本号** | `/home/eclipse/omarchy-agent-ready-release/manifest.json` 现在是 `1.1.0`；与 GitHub Release tag 保持一致 |
+| ★5 | **版本号** | `manifest.json` 现在是 `1.1.0`；与 GitHub Release tag 保持一致 |
 | ★6 | **manifest description** | 当前描述偏旧（只提 countdown + settings panel），建议补上 auto-arm / digest history / 语言 / 开关 |
-| 7 | 死代码清理（可选） | `/home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready` 的 `AUTO_STATE_FILE` 常量未使用，可删 |
+| 7 | 死代码清理（可选） | `bin/omarchy-agent-ready` 的 `AUTO_STATE_FILE` 常量未使用，可删 |
 | 8 | 语言选项位置 | 语言三档在 **Advanced 最底部**（用户明确要求），不要挪回顶部 |
 | 9 | 固定 Hero | 设置面板 Hero 是**固定信息栏**，不要放回 ScrollView 里 |
 | 10 | 运行时数据 | 确认仓库里**没有** `$HOME/.local/state/omarchy/agent-ready/state.json` / `$HOME/.local/state/omarchy/agent-ready/digest.json` / `$HOME/.local/state/omarchy/agent-ready/history.json` / `*.log`（`$HOME/.local/state/...` 下的真实数据不要复制进来） |
@@ -608,13 +612,13 @@ CLI 通知最早中英混排写死。现全部进共享 catalog，且支持**插
 
 **发布前请再跑一次**（在隔离 HOME，不要污染真实系统）：
 ```bash
-bash -n /home/eclipse/omarchy-agent-ready-release/install.sh /home/eclipse/omarchy-agent-ready-release/uninstall.sh /home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready
-omarchy plugin validate /home/eclipse/omarchy-agent-ready-release
+bash -n install.sh uninstall.sh bin/omarchy-agent-ready
+omarchy plugin validate .
 T=$(mktemp -d); mkdir -p "$T/.config/omarchy"
 echo '{"bar":{"layout":{"center":[],"right":[]}},"idle":{"screensaver":150,"lock":300}}' > "$T/.config/omarchy/shell.json"
-HOME="$T" /home/eclipse/omarchy-agent-ready-release/install.sh --no-restart
+HOME="$T" install.sh --no-restart
 HOME="$T" "$T/.local/bin/omarchy-agent-ready" doctor
-HOME="$T" /home/eclipse/omarchy-agent-ready-release/uninstall.sh --no-restart --purge
+HOME="$T" uninstall.sh --no-restart --purge
 rm -rf "$T"
 ```
 
@@ -623,10 +627,10 @@ rm -rf "$T"
 ## 13. 发布到 GitHub 的步骤
 
 1. **建仓库**（建议名 `omarchy-agent-ready`），visibility public，初始化时**不要**勾选
-   `/home/eclipse/omarchy-agent-ready-release/README.md` / `/home/eclipse/omarchy-agent-ready-release/LICENSE`（本地已有，避免冲突）。
+   `README.md` / `LICENSE`（本地已有，避免冲突）。
 2. 在本目录执行：
    ```bash
-   cd /home/eclipse/omarchy-agent-ready-release
+   cd .
    git init -b main
    git add -A
    git commit -m "Initial release: Agent Ready for Omarchy"
@@ -638,8 +642,8 @@ rm -rf "$T"
 4. **Release**：tag `v1.1.0`（与 manifest 对齐），写 changelog（见第 19 节演进历史）。
 5. **可选增强**（按性价比排序）：
    - 提交到 Omarchy 官方 plugin catalog（若该项目接受第三方插件收录）
-   - 提供 Arch `PKGBUILD` / AUR 包（`/home/eclipse/omarchy-agent-ready-release/install.sh` 逻辑可直接复用）
-   - GitHub Actions：只对 `/home/eclipse/omarchy-agent-ready-release/install.sh`/`/home/eclipse/omarchy-agent-ready-release/uninstall.sh`/CLI 跑 `bash -n`、`jq -e` 校验两份 i18n key parity、
+   - 提供 Arch `PKGBUILD` / AUR 包（`install.sh` 逻辑可直接复用）
+   - GitHub Actions：只对 `install.sh`/`uninstall.sh`/CLI 跑 `bash -n`、`jq -e` 校验两份 i18n key parity、
      `omarchy plugin validate`（后者需要 Omarchy 环境，可用容器或跳过）
    - 补一张架构图（本文第 2 节的 ASCII 图可转成 mermaid）
 6. **README 徽章**（可选）：License、Release version、Omarchy。
@@ -685,22 +689,22 @@ rm -rf "$T"
 
 ## 15. 安装 / 卸载方案
 
-`/home/eclipse/omarchy-agent-ready-release/install.sh`（已实测）做 8 件事：
+`install.sh`（已实测）做 8 件事：
 1. 校验仓库文件齐全、`$HOME/.config/omarchy` 存在、`jq` 可用；缺失的运行时命令只告警
-2. `install -m 755 /home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready → $HOME/.local/bin/`
-3. `/home/eclipse/omarchy-agent-ready-release/config/config.json → $HOME/.config/omarchy/agent-ready/`（**仅首次**；`--force` 才覆盖）
+2. `install -m 755 bin/omarchy-agent-ready → $HOME/.local/bin/`
+3. `config/config.json → $HOME/.config/omarchy/agent-ready/`（**仅首次**；`--force` 才覆盖）
 4. `$HOME/.config/omarchy/agent-ready/enter.d/` / `$HOME/.config/omarchy/agent-ready/leave.d/` 的 README 与 `.disabled` 示例（`cp -n`，不覆盖用户已启用的 hook）
-5. `/home/eclipse/omarchy-agent-ready-release/manifest.json` / `/home/eclipse/omarchy-agent-ready-release/Widget.qml` / `/home/eclipse/omarchy-agent-ready-release/PluginI18n.qml` / `/home/eclipse/omarchy-agent-ready-release/i18n/*.json` → 插件目录（可覆盖更新）
+5. `manifest.json` / `Widget.qml` / `PluginI18n.qml` / `i18n/*.json` → 插件目录（可覆盖更新）
 6. 幂等注册 `$HOME/.config/omarchy/shell.json`（先备份 `$HOME/.config/omarchy/shell.json.agent-ready.bak`；默认 `right`，`--section` 可改）
 7. `omarchy-plugin-validate` + `omarchy-agent-ready doctor`
 8. `omarchy restart shell`（`--no-restart` 可跳过）
 
-`/home/eclipse/omarchy-agent-ready-release/uninstall.sh`：先调 `off` 恢复正常状态 → 从 `$HOME/.config/omarchy/shell.json` 各 section 移除 id →
+`uninstall.sh`：先调 `off` 恢复正常状态 → 从 `$HOME/.config/omarchy/shell.json` 各 section 移除 id →
 删 CLI 与插件目录 → 默认**保留** config/state（`--purge` 才删）→ 重启 shell。
 
 两种安装途径（README 里都写了）：
-- **推荐**：`git clone` + `/home/eclipse/omarchy-agent-ready-release/install.sh`（一步到位）
-- **仅插件**：`omarchy plugin add <url> --enable`，再跑 `/home/eclipse/omarchy-agent-ready-release/install.sh --no-restart` 补 CLI/config
+- **推荐**：`git clone` + `install.sh`（一步到位）
+- **仅插件**：`omarchy plugin add <url> --enable`，再跑 `install.sh --no-restart` 补 CLI/config
 
 ---
 
@@ -709,9 +713,9 @@ rm -rf "$T"
 发布前 / 用户安装后按此验收（本机已全部通过）：
 
 **静态**
-- `bash -n` 三个脚本；所有 JSON `jq -e .`；`omarchy plugin validate /home/eclipse/omarchy-agent-ready-release`
+- `bash -n` 三个脚本；所有 JSON `jq -e .`；`omarchy plugin validate .`
 - 两份 i18n key parity（`en` = `zh-CN`，当前 127/127）
-- `/home/eclipse/omarchy-agent-ready-release/Widget.qml` 括号平衡、无重复 id
+- `Widget.qml` 括号平衡、无重复 id
 
 **CLI 沙盒**（`AGENT_READY_*_DIR` 指向临时目录，禁用所有真实电源动作）
 - 完整状态机 `arm / disarm / auto-arm / preview / on / off` 的 `phase` 流转
@@ -770,7 +774,7 @@ rm -rf "$T"
 3. **开机状态对账**：机器在 Agent Ready 激活时重启/关机后，下次开机的状态一致性**尚未处理**
    （state 文件可能残留 enabled=true 但 inhibitor 已不存在）。建议加启动时的 reconcile / 清理。
 4. **更精确的 agent 检测**：目前只按进程名；可考虑读 agent 会话目录或用 hook 注入。
-5. **更多语言 catalog**（社区贡献入口已在 `/home/eclipse/omarchy-agent-ready-release/docs/PLUGIN.md` 写好）。
+5. **更多语言 catalog**（社区贡献入口已在 `docs/PLUGIN.md` 写好）。
 6. **CI / PKGBUILD / 官方插件收录**（第 13 节）。
 
 没有已知的阻断性缺陷。
@@ -803,16 +807,16 @@ rm -rf "$T"
 ### 源码索引（本机原始路径，交接前的开发位置）
 
 ```
-/home/eclipse/.local/bin/omarchy-agent-ready                          → /home/eclipse/omarchy-agent-ready-release/bin/omarchy-agent-ready
-/home/eclipse/.config/omarchy/agent-ready/config.json                 → /home/eclipse/omarchy-agent-ready-release/config/config.json（模板已重置为默认值）
-/home/eclipse/.config/omarchy/agent-ready/README.md                   → /home/eclipse/omarchy-agent-ready-release/docs/CLI.md
-/home/eclipse/.config/omarchy/agent-ready/{enter,leave}.d/*           → /home/eclipse/omarchy-agent-ready-release/config/{enter,leave}.d
-/home/eclipse/.config/omarchy/plugins/eclipse.agent-ready/*           → /home/eclipse/omarchy-agent-ready-release（/home/eclipse/omarchy-agent-ready-release/manifest.json / /home/eclipse/omarchy-agent-ready-release/Widget.qml / /home/eclipse/omarchy-agent-ready-release/PluginI18n.qml / /home/eclipse/omarchy-agent-ready-release/i18n）
-/home/eclipse/.config/omarchy/plugins/eclipse.agent-ready/README.md   → /home/eclipse/omarchy-agent-ready-release/docs/PLUGIN.md
-/home/eclipse/.config/omarchy/shell.json                              → bar.layout.center 含 {"id":"eclipse.agent-ready"}
+$HOME/.local/bin/omarchy-agent-ready                          → bin/omarchy-agent-ready
+$HOME/.config/omarchy/agent-ready/config.json                 → config/config.json（模板已重置为默认值）
+$HOME/.config/omarchy/agent-ready/README.md                   → docs/CLI.md
+$HOME/.config/omarchy/agent-ready/{enter,leave}.d/*           → config/{enter,leave}.d
+$HOME/.config/omarchy/plugins/eclipse.agent-ready/*           → .（manifest.json / Widget.qml / PluginI18n.qml / i18n）
+$HOME/.config/omarchy/plugins/eclipse.agent-ready/README.md   → docs/PLUGIN.md
+$HOME/.config/omarchy/shell.json                              → bar.layout.center 含 {"id":"eclipse.agent-ready"}
 ```
 
-**运行时数据不在仓库内**：作者机器历史位置 `/home/eclipse/.local/state/omarchy/agent-ready/`（用户已有真实值守历史，未复制）；其他用户对应 `$HOME/.local/state/omarchy/agent-ready/`。
+**运行时数据不在仓库内**：作者机器历史位置 `$HOME/.local/state/omarchy/agent-ready/`（用户已有真实值守历史，未复制）；其他用户对应 `$HOME/.local/state/omarchy/agent-ready/`。
 
 ---
 

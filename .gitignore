@@ -18,3 +18,15 @@ log
 
 # Local install smoke-test scratch
 /tmp/
+
+# Internal review / handoff documents and fix-round notes.
+REVIEW-BRIEF.md
+REVIEW-REPORT.md
+TRANSFER-README.md
+FIX-ROUND*.md
+FIX-ROUND*-RESULT.md
+FIX-ROUND2-RESUME.md
+
+# Author-machine snapshots and rollback artifacts.
+/live/
+*.release-backup
